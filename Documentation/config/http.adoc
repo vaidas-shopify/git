@@ -1,6 +1,5 @@
 http.proxy::
 	Override the HTTP proxy, normally configured using the 'http_proxy',
-	'https_proxy', and 'all_proxy' environment variables (see `curl(1)`). In
 	addition to the syntax understood by curl, it is possible to specify a
 	proxy string with a user name but no password, in which case git will
 	attempt to acquire one in the same way it does for other credentials. See
@@ -48,12 +47,10 @@ http.proxySSLCertPasswordProtected::
 	Enable Git's password prompt for the proxy SSL certificate.  Otherwise OpenSSL
 	will prompt the user, possibly many times, if the certificate or private key
 	is encrypted. Can be overridden by the `GIT_PROXY_SSL_CERT_PASSWORD_PROTECTED`
-	environment variable.
 
 http.proxySSLCAInfo::
 	Pathname to the file containing the certificate bundle that should be used to
 	verify the proxy with when using an HTTPS proxy. Can be overridden by the
-	`GIT_PROXY_SSL_CAINFO` environment variable.
 
 http.emptyAuth::
 	Attempt authentication without seeking a username or password.  This
@@ -162,7 +159,6 @@ http.sslVersion::
 	- tlsv1.3
 
 +
-Can be overridden by the `GIT_SSL_VERSION` environment variable.
 To force git to use libcurl's default ssl version and ignore any
 explicit http.sslversion option, set `GIT_SSL_VERSION` to the
 empty string.
@@ -175,7 +171,6 @@ http.sslCipherList::
   option; see the libcurl documentation for more details on the format
   of this list.
 +
-Can be overridden by the `GIT_SSL_CIPHER_LIST` environment variable.
 To force git to use libcurl's default cipher list and ignore any
 explicit http.sslCipherList option, set `GIT_SSL_CIPHER_LIST` to the
 empty string.
@@ -183,7 +178,6 @@ empty string.
 http.sslVerify::
 	Whether to verify the SSL certificate when fetching or pushing
 	over HTTPS. Defaults to true. Can be overridden by the
-	`GIT_SSL_NO_VERIFY` environment variable.
 
 http.sslCert::
 	File containing the SSL certificate when fetching or pushing
@@ -199,17 +193,14 @@ http.sslCertPasswordProtected::
 	Enable Git's password prompt for the SSL certificate.  Otherwise
 	OpenSSL will prompt the user, possibly many times, if the
 	certificate or private key is encrypted.  Can be overridden by the
-	`GIT_SSL_CERT_PASSWORD_PROTECTED` environment variable.
 
 http.sslCAInfo::
 	File containing the certificates to verify the peer with when
 	fetching or pushing over HTTPS. Can be overridden by the
-	`GIT_SSL_CAINFO` environment variable.
 
 http.sslCAPath::
 	Path containing files with the CA certificates to verify the peer
 	with when fetching or pushing over HTTPS. Can be overridden
-	by the `GIT_SSL_CAPATH` environment variable.
 
 http.sslBackend::
 	Name of the SSL backend to use (e.g. "openssl" or "schannel").
@@ -221,7 +212,6 @@ http.sslCertType::
 	"PEM", "DER" are supported when using openssl or gnutls backends. "P12"
 	is supported on "openssl", "schannel", "securetransport", and gnutls 8.11+.
 	See also libcurl `CURLOPT_SSLCERTTYPE`. Can be overridden by the
-	`GIT_SSL_CERT_TYPE` environment variable.
 
 http.sslKeyType::
 	Type of client private key used when fetching or pushing over HTTPS. (e.g.
@@ -229,7 +219,6 @@ http.sslKeyType::
 	is not supported with openssl. Particularly useful when set to "ENG" for
 	authenticating with PKCS#11 tokens, with a PKCS#11 URL in sslCert option.
 	See also libcurl `CURLOPT_SSLKEYTYPE`. Can be overridden by the
-	`GIT_SSL_KEY_TYPE` environment variable.
 
 http.schannelCheckRevoke::
 	Used to enforce or disable certificate revocation checks in cURL
@@ -265,7 +254,6 @@ http.sslTry::
 
 http.maxRequests::
 	How many HTTP requests to launch in parallel. Can be overridden
-	by the `GIT_HTTP_MAX_REQUESTS` environment variable. Default is 5.
 
 http.minSessions::
 	The number of curl sessions (counted across slots) to be kept across
@@ -294,32 +282,51 @@ http.lowSpeedTime::
 	If the HTTP transfer speed, in bytes per second, is less than
 	'http.lowSpeedLimit' for longer than 'http.lowSpeedTime' seconds,
 	the transfer is aborted.
-	Can be overridden by the `GIT_HTTP_LOW_SPEED_LIMIT` and
-	`GIT_HTTP_LOW_SPEED_TIME` environment variables.
+	
 
 http.keepAliveIdle::
 	Specifies how long in seconds to wait on an idle connection
 	before sending TCP keepalive probes (if supported by the OS). If
 	unset, curl's default value is used. Can be overridden by the
-	`GIT_HTTP_KEEPALIVE_IDLE` environment variable.
 
 http.keepAliveInterval::
 	Specifies how long in seconds to wait between TCP keepalive
 	probes (if supported by the OS). If unset, curl's default value
-	is used. Can be overridden by the `GIT_HTTP_KEEPALIVE_INTERVAL`
-	environment variable.
+	is used. 
 
 http.keepAliveCount::
 	Specifies how many TCP keepalive probes to send before giving up
 	and terminating the connection (if supported by the OS). If
 	unset, curl's default value is used. Can be overridden by the
-	`GIT_HTTP_KEEPALIVE_COUNT` environment variable.
+
+http.retryAfter::
+	Default wait time in seconds before retrying when a server returns
+	HTTP 429 (Too Many Requests) without a Retry-After header. If set
+	to -1 (the default), Git will fail immediately when encountering
+	a 429 response without a Retry-After header. When a Retry-After
+	header is present, its value takes precedence over this setting.
+	
+	See also `http.maxRetries` and `http.maxRetryTime`.
+
+http.maxRetries::
+	Maximum number of times to retry after receiving HTTP 429 (Too Many
+	Requests) responses. Set to 0 (the default) to disable retries.
+	
+	See also `http.retryAfter` and `http.maxRetryTime`.
+
+http.maxRetryTime::
+	Maximum time in seconds to wait for a single retry attempt when
+	handling HTTP 429 (Too Many Requests) responses. If the server
+	requests a delay (via Retry-After header) or if `http.retryAfter`
+	is configured with a value that exceeds this maximum, Git will fail
+	immediately rather than waiting. Default is 300 seconds (5 minutes).
+	
+	variable. See also `http.retryAfter` and `http.maxRetries`.
 
 http.noEPSV::
 	A boolean which disables using of EPSV ftp command by curl.
 	This can be helpful with some "poor" ftp servers which don't
 	support EPSV mode. Can be overridden by the `GIT_CURL_FTP_NO_EPSV`
-	environment variable. Default is false (curl will use EPSV).
 
 http.userAgent::
 	The HTTP USER_AGENT string presented to an HTTP server.  The default
@@ -328,7 +335,7 @@ http.userAgent::
 	such as Mozilla/4.0.  This may be necessary, for instance, if
 	connecting through a firewall that restricts HTTP connections to a set
 	of common USER_AGENT strings (but not including those like git/1.7.1).
-	Can be overridden by the `GIT_HTTP_USER_AGENT` environment variable.
+	
 
 http.followRedirects::
 	Whether git should follow HTTP redirects. If set to `true`, git
