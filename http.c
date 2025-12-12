@@ -2369,6 +2369,10 @@ static int http_request_reauth(const char *url,
 	if (ret != HTTP_OK && ret != HTTP_REAUTH && ret != HTTP_RATE_LIMITED)
 		return ret;
 
+	/* If retries are disabled and we got a 429, fail immediately */
+	if (ret == HTTP_RATE_LIMITED && http_max_retries == 0)
+		return HTTP_ERROR;
+
 	if (options && options->effective_url && options->base_url) {
 		if (update_url_from_redirect(options->base_url,
 					     url, options->effective_url)) {
@@ -2405,11 +2409,6 @@ static int http_request_reauth(const char *url,
 
 		if (ret == HTTP_RATE_LIMITED) {
 			/* Handle rate limiting with retry logic */
-			int retry_attempt = http_max_retries - rate_limit_retries + 1;
-
-			trace2_data_intmax("http", the_repository, "http/429-retry-attempt",
-					retry_attempt);
-
 			if (rate_limit_retries <= 0) {
 				/* Retries are disabled or exhausted */
 				if (http_max_retries > 0) {
@@ -2419,6 +2418,11 @@ static int http_request_reauth(const char *url,
 				}
 				return HTTP_ERROR;
 			}
+
+			int retry_attempt = http_max_retries - rate_limit_retries + 1;
+
+			trace2_data_intmax("http", the_repository, "http/429-retry-attempt",
+					retry_attempt);
 
 			/* Decrement retries counter */
 			rate_limit_retries--;
