@@ -402,6 +402,7 @@ out:
 	va_start(ap, fmt);
 	die_message_routine(fmt, ap);
 	va_end(ap);
+	exit(128);
 }
 
 static int get_protocol_http_header(enum protocol_version version,
