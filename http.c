@@ -2355,7 +2355,75 @@ static void sleep_for_retry(long retry_after)
 	}
 }
 
-static int http_request_reauth(const char *url,
+/*
+ * Handle rate limiting retry logic for HTTP 429 responses.
+ * Returns HTTP_ERROR if retries are exhausted or configuration is invalid,
+ * otherwise returns 0 to indicate the retry should proceed.
+ */
+static int handle_rate_limit_retry(int *rate_limit_retries)
+{
+	int retry_attempt = http_max_retries - *rate_limit_retries + 1;
+
+	if (*rate_limit_retries <= 0) {
+		/* Retries are disabled or exhausted */
+		if (http_max_retries > 0) {
+			error(_("too many rate limit retries, giving up"));
+			trace2_data_string("http", the_repository,
+					"http/429-error", "retries-exhausted");
+		}
+		return HTTP_ERROR;
+	}
+
+	trace2_data_intmax("http", the_repository, "http/429-retry-attempt",
+			retry_attempt);
+
+	/* Decrement retries counter */
+	(*rate_limit_retries)--;
+
+	/* Use the stored retry_after value or configured default */
+	if (last_retry_after >= 0) {
+		/* Check if retry delay exceeds maximum allowed */
+		if (last_retry_after > http_max_retry_time) {
+			error(_("rate limited (HTTP 429) requested %ld second delay, "
+				"exceeds http.maxRetryTime of %ld seconds"),
+			      last_retry_after, http_max_retry_time);
+			trace2_data_string("http", the_repository,
+					"http/429-error", "exceeds-max-retry-time");
+			trace2_data_intmax("http", the_repository,
+					"http/429-requested-delay", last_retry_after);
+			last_retry_after = -1; /* Reset after use */
+			return HTTP_ERROR;
+		}
+		sleep_for_retry(last_retry_after);
+		last_retry_after = -1; /* Reset after use */
+	} else {
+		/* No Retry-After header provided */
+		if (http_retry_after < 0) {
+			/* Not configured - exit with error */
+			error(_("rate limited (HTTP 429) and no Retry-After header provided. "
+				"Configure http.retryAfter or set GIT_HTTP_RETRY_AFTER."));
+			trace2_data_string("http", the_repository,
+					"http/429-error", "no-retry-after-config");
+			return HTTP_ERROR;
+		}
+		/* Check if configured default exceeds maximum allowed */
+		if (http_retry_after > http_max_retry_time) {
+			error(_("configured http.retryAfter (%ld seconds) exceeds "
+				"http.maxRetryTime (%ld seconds)"),
+			      http_retry_after, http_max_retry_time);
+			trace2_data_string("http", the_repository,
+					"http/429-error", "config-exceeds-max-retry-time");
+			return HTTP_ERROR;
+		}
+		/* Use configured default retry-after value */
+		trace2_data_string("http", the_repository,
+				"http/429-retry-source", "config-default");
+		sleep_for_retry(http_retry_after);
+	}
+	return 0;
+}
+
+static int http_request_recoverable(const char *url,
 			       void *result, int target,
 			       struct http_get_options *options)
 {
@@ -2410,65 +2478,9 @@ static int http_request_reauth(const char *url,
 		}
 
 		if (ret == HTTP_RATE_LIMITED) {
-			/* Handle rate limiting with retry logic */
-			int retry_attempt = http_max_retries - rate_limit_retries + 1;
-
-			if (rate_limit_retries <= 0) {
-				/* Retries are disabled or exhausted */
-				if (http_max_retries > 0) {
-					error(_("too many rate limit retries, giving up"));
-					trace2_data_string("http", the_repository,
-							"http/429-error", "retries-exhausted");
-				}
-				return HTTP_ERROR;
-			}
-
-			trace2_data_intmax("http", the_repository, "http/429-retry-attempt",
-					retry_attempt);
-
-			/* Decrement retries counter */
-			rate_limit_retries--;
-
-			/* Use the stored retry_after value or configured default */
-			if (last_retry_after >= 0) {
-				/* Check if retry delay exceeds maximum allowed */
-				if (last_retry_after > http_max_retry_time) {
-					error(_("rate limited (HTTP 429) requested %ld second delay, "
-						"exceeds http.maxRetryTime of %ld seconds"),
-					      last_retry_after, http_max_retry_time);
-					trace2_data_string("http", the_repository,
-							"http/429-error", "exceeds-max-retry-time");
-					trace2_data_intmax("http", the_repository,
-							"http/429-requested-delay", last_retry_after);
-					last_retry_after = -1; /* Reset after use */
-					return HTTP_ERROR;
-				}
-				sleep_for_retry(last_retry_after);
-				last_retry_after = -1; /* Reset after use */
-			} else {
-				/* No Retry-After header provided */
-				if (http_retry_after < 0) {
-					/* Not configured - exit with error */
-					error(_("rate limited (HTTP 429) and no Retry-After header provided. "
-						"Configure http.retryAfter or set GIT_HTTP_RETRY_AFTER."));
-					trace2_data_string("http", the_repository,
-							"http/429-error", "no-retry-after-config");
-					return HTTP_ERROR;
-				}
-			/* Check if configured default exceeds maximum allowed */
-			if (http_retry_after > http_max_retry_time) {
-				error(_("configured http.retryAfter (%ld seconds) exceeds "
-					"http.maxRetryTime (%ld seconds)"),
-				      http_retry_after, http_max_retry_time);
-				trace2_data_string("http", the_repository,
-						"http/429-error", "config-exceeds-max-retry-time");
-				return HTTP_ERROR;
-			}
-			/* Use configured default retry-after value */
-			trace2_data_string("http", the_repository,
-					"http/429-retry-source", "config-default");
-			sleep_for_retry(http_retry_after);
-			}
+			int retry_result = handle_rate_limit_retry(&rate_limit_retries);
+			if (retry_result != 0)
+				return retry_result;
 		} else if (ret == HTTP_REAUTH) {
 			credential_fill(the_repository, &http_auth, 1);
 		}
@@ -2482,7 +2494,7 @@ int http_get_strbuf(const char *url,
 		    struct strbuf *result,
 		    struct http_get_options *options)
 {
-	return http_request_reauth(url, result, HTTP_REQUEST_STRBUF, options);
+	return http_request_recoverable(url, result, HTTP_REQUEST_STRBUF, options);
 }
 
 /*
@@ -2506,7 +2518,7 @@ int http_get_file(const char *url, const char *filename,
 		goto cleanup;
 	}
 
-	ret = http_request_reauth(url, result, HTTP_REQUEST_FILE, options);
+	ret = http_request_recoverable(url, result, HTTP_REQUEST_FILE, options);
 	fclose(result);
 
 	if (ret == HTTP_OK && finalize_object_file(the_repository, tmpfile.buf, filename))
