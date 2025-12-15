@@ -152,13 +152,15 @@ static char *http_ssl_backend;
 
 static int http_schannel_check_revoke = 1;
 
-/* Retry configuration */
-static long http_retry_after = -1; /* Default retry-after in seconds when header is missing (-1 means not set, exit with 128) */
-static long http_max_retries = 0; /* Maximum number of retry attempts (0 means retries are disabled) */
-static long http_max_retry_time = 300; /* Maximum time to wait for a single retry (default 5 minutes) */
-
-/* Store retry_after value from 429 responses for retry logic (-1 = not set, 0 = retry immediately, >0 = delay in seconds) */
+static long http_retry_after = -1;
+static long http_max_retries = 0;
+static long http_max_retry_time = 300;
+/*
+ * Store retry_after value from 429 responses for retry logic
+ * (-1 = not set, 0 = retry immediately, >0 = delay in seconds).
+ */
 static long last_retry_after = -1;
+
 /*
  * With the backend being set to `schannel`, setting sslCAinfo would override
  * the Certificate Store in cURL v7.60.0 and later, which is not what we want
