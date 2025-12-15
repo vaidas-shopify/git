@@ -717,7 +717,7 @@ static int fetch_indices(void)
 		ret = 0;
 		break;
 	case HTTP_RATE_LIMITED:
-		error("rate limited by '%s', please try again later", repo->url);
+		error(_("rate limited by '%s', please try again later"), repo->url);
 		ret = -1;
 		break;
 	default:
@@ -1553,7 +1553,7 @@ static int remote_exists(const char *path)
 		ret = 0;
 		break;
 	case HTTP_RATE_LIMITED:
-		error("rate limited by '%s', please try again later", url);
+		error(_("rate limited by '%s', please try again later"), url);
 		ret = -1;
 		break;
 	case HTTP_ERROR:
