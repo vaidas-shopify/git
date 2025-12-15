@@ -2409,6 +2409,8 @@ static int http_request_reauth(const char *url,
 
 		if (ret == HTTP_RATE_LIMITED) {
 			/* Handle rate limiting with retry logic */
+			int retry_attempt = http_max_retries - rate_limit_retries + 1;
+
 			if (rate_limit_retries <= 0) {
 				/* Retries are disabled or exhausted */
 				if (http_max_retries > 0) {
@@ -2418,8 +2420,6 @@ static int http_request_reauth(const char *url,
 				}
 				return HTTP_ERROR;
 			}
-
-			int retry_attempt = http_max_retries - rate_limit_retries + 1;
 
 			trace2_data_intmax("http", the_repository, "http/429-retry-attempt",
 					retry_attempt);
