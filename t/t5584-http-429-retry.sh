@@ -31,7 +31,7 @@ test_expect_success 'HTTP 429 with retries disabled (maxRetries=0) fails immedia
 	test_must_fail git ls-remote "$HTTPD_URL/http_429/retries-disabled/1/repo.git" 2>err &&
 
 	# Verify no retry happened (no "waiting" message in stderr)
-	! grep -i "waiting.*retry" err
+	test_grep ! -i "waiting.*retry" err
 '
 
 test_expect_success 'HTTP 429 permanent should fail after max retries' '
@@ -224,7 +224,7 @@ test_expect_success 'HTTP 429 will not be retried without config' '
 	test_must_fail git ls-remote "$HTTPD_URL/http_429/no-retry-without-config/1/repo.git" 2>err &&
 
 	# Verify no retry happened (no "waiting" message)
-	! grep -i "waiting.*retry" err &&
+	test_grep ! -i "waiting.*retry" err &&
 
 	# Should get 429 error
 	test_grep "429" err
