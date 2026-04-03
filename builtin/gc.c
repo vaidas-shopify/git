@@ -265,6 +265,7 @@ enum maintenance_task_label {
 	TASK_WORKTREE_PRUNE,
 	TASK_RERERE_GC,
 	TASK_ANTI_CRUFT,
+	TASK_SCOPED_GC,
 
 	/* Leave as final value */
 	TASK__COUNT
@@ -1943,6 +1944,84 @@ static int anti_cruft_auto_condition(struct gc_config *cfg UNUSED)
 	return anchors->nr > 0;
 }
 
+/*
+ * Scoped GC: lightweight garbage collection that only processes
+ * unpinned (young generation) objects. Anti-cruft packs are kept
+ * intact via --keep-pack, so the reachability walk and repack only
+ * cover the young generation.
+ */
+static int maintenance_task_scoped_gc(struct maintenance_run_opts *opts,
+				      struct gc_config *cfg UNUSED)
+{
+	struct repository *r = the_repository;
+	struct child_process child = CHILD_PROCESS_INIT;
+	struct packed_git *p;
+	const char *expiration = "2.weeks.ago";
+	int have_anchored = 0;
+
+	repo_config_get_string_tmp(r, "maintenance.scoped-gc.expiration",
+				   &expiration);
+
+	child.git_cmd = 1;
+	strvec_pushl(&child.args, "repack", "-d", "-l", "--cruft", NULL);
+	strvec_pushf(&child.args, "--cruft-expiration=%s", expiration);
+
+	if (opts->quiet)
+		strvec_push(&child.args, "--quiet");
+
+	/*
+	 * Keep all anti-cruft packs intact. The reachability walk
+	 * during repack will traverse into kept packs to find
+	 * reachable objects, but won't rewrite them. Objects in kept
+	 * packs serve as reachability "roots" — when the walk hits
+	 * an object in a kept pack, it knows it's reachable.
+	 */
+	repo_for_each_pack(r, p) {
+		if (!p->is_anchored)
+			continue;
+		have_anchored = 1;
+		strvec_pushf(&child.args, "--keep-pack=%s",
+			     pack_basename(p));
+	}
+
+	/*
+	 * If no anti-cruft packs exist, this degrades to a normal
+	 * cruft repack (which is fine but expensive). In practice,
+	 * scoped-gc is only useful after anti-cruft has pinned objects.
+	 */
+	if (!have_anchored)
+		warning(_("scoped-gc: no anti-cruft packs found; "
+			  "this will be equivalent to a full cruft repack"));
+
+	if (run_command(&child))
+		return error(_("failed to perform scoped garbage collection"));
+
+	return 0;
+}
+
+static int scoped_gc_auto_condition(struct gc_config *cfg UNUSED)
+{
+	struct packed_git *p;
+	int have_anchored = 0;
+	int have_young_packs = 0;
+
+	/*
+	 * Scoped GC is useful when there are both anti-cruft packs
+	 * (old generation) and regular packs (young generation) to
+	 * process.
+	 */
+	repo_for_each_pack(the_repository, p) {
+		if (p->is_anchored)
+			have_anchored = 1;
+		else if (!p->is_cruft && !p->pack_keep)
+			have_young_packs = 1;
+		if (have_anchored && have_young_packs)
+			return 1;
+	}
+
+	return 0;
+}
+
 typedef int (*maintenance_task_fn)(struct maintenance_run_opts *opts,
 				   struct gc_config *cfg);
 typedef int (*maintenance_auto_fn)(struct gc_config *cfg);
@@ -2025,6 +2104,11 @@ static const struct maintenance_task tasks[] = {
 		.name = "anti-cruft",
 		.background = maintenance_task_anti_cruft,
 		.auto_condition = anti_cruft_auto_condition,
+	},
+	[TASK_SCOPED_GC] = {
+		.name = "scoped-gc",
+		.background = maintenance_task_scoped_gc,
+		.auto_condition = scoped_gc_auto_condition,
 	},
 };
 
