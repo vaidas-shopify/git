@@ -1677,6 +1677,63 @@ out:
  * in generational GC).
  */
 
+/*
+ * Validate all anti-cruft packs: check that each pack's anchor ref
+ * still exists and still descends from the recorded anchor commit.
+ * Demote invalid packs by removing the .anchored file.
+ */
+static void validate_anti_cruft_packs(void)
+{
+	struct packed_git *p;
+	struct repository *r = the_repository;
+
+	repo_for_each_pack(r, p) {
+		struct anchored_data adata = { 0 };
+		struct object_id ref_oid;
+		struct child_process merge_base = CHILD_PROCESS_INIT;
+
+		if (!p->is_anchored)
+			continue;
+		if (load_pack_anchored(p, &adata)) {
+			warning(_("anti-cruft: cannot load .anchored for %s, demoting"),
+				p->pack_name);
+			remove_pack_anchored(p);
+			continue;
+		}
+
+		/* Check if the anchor ref still exists */
+		if (!refs_resolve_ref_unsafe(get_main_ref_store(r),
+					     adata.anchor_ref,
+					     RESOLVE_REF_READING,
+					     &ref_oid, NULL)) {
+			warning(_("anti-cruft: anchor ref '%s' no longer exists, "
+				  "demoting pack %s"),
+				adata.anchor_ref, p->pack_name);
+			remove_pack_anchored(p);
+			clear_anchored_data(&adata);
+			continue;
+		}
+
+		/*
+		 * Check if the recorded anchor commit is an ancestor of
+		 * the current ref tip. Use merge-base --is-ancestor.
+		 */
+		merge_base.git_cmd = 1;
+		strvec_pushl(&merge_base.args, "merge-base", "--is-ancestor",
+			     oid_to_hex(&adata.anchor_commit),
+			     oid_to_hex(&ref_oid), NULL);
+		if (run_command(&merge_base)) {
+			warning(_("anti-cruft: anchor commit %s is not ancestor "
+				  "of %s tip, demoting pack %s"),
+				oid_to_hex(&adata.anchor_commit),
+				adata.anchor_ref, p->pack_name);
+			remove_pack_anchored(p);
+		}
+
+		clear_anchored_data(&adata);
+	}
+}
+
 static struct object_id *find_last_pinned_commit(const char *anchor_ref)
 {
 	struct packed_git *p;
@@ -1719,6 +1776,9 @@ static int maintenance_task_anti_cruft(struct maintenance_run_opts *opts,
 	if (repo_config_get_string_multi(r, "maintenance.anti-cruft.anchor",
 					 &anchors))
 		return 0; /* no anchor refs configured */
+
+	/* Validate existing anti-cruft packs before pinning new ones */
+	validate_anti_cruft_packs();
 
 	repo_config_get_string_tmp(r, "maintenance.anti-cruft.min-age",
 				   &min_age_str);
