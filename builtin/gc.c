@@ -2279,6 +2279,14 @@ static const struct maintenance_strategy geometric_strategy = {
 			.type = MAINTENANCE_TYPE_SCHEDULED | MAINTENANCE_TYPE_MANUAL,
 			.schedule = SCHEDULE_WEEKLY,
 		},
+		[TASK_ANTI_CRUFT] = {
+			.type = MAINTENANCE_TYPE_SCHEDULED | MAINTENANCE_TYPE_MANUAL,
+			.schedule = SCHEDULE_DAILY,
+		},
+		[TASK_SCOPED_GC] = {
+			.type = MAINTENANCE_TYPE_SCHEDULED | MAINTENANCE_TYPE_MANUAL,
+			.schedule = SCHEDULE_WEEKLY,
+		},
 	},
 };
 
