@@ -449,7 +449,7 @@ void close_pack(struct packed_git *p)
 
 void unlink_pack_path(const char *pack_name, int force_delete)
 {
-	static const char *exts[] = {".idx", ".pack", ".rev", ".keep", ".bitmap", ".promisor", ".mtimes"};
+	static const char *exts[] = {".idx", ".pack", ".rev", ".keep", ".bitmap", ".promisor", ".mtimes", ".anchored"};
 	int i;
 	struct strbuf buf = STRBUF_INIT;
 	size_t plen;
@@ -834,6 +834,10 @@ struct packed_git *add_packed_git(struct repository *r, const char *path,
 	xsnprintf(p->pack_name + path_len, alloc - path_len, ".mtimes");
 	if (!access(p->pack_name, F_OK))
 		p->is_cruft = 1;
+
+	xsnprintf(p->pack_name + path_len, alloc - path_len, ".anchored");
+	if (!access(p->pack_name, F_OK))
+		p->is_anchored = 1;
 
 	xsnprintf(p->pack_name + path_len, alloc - path_len, ".pack");
 	if (stat(p->pack_name, &st) || !S_ISREG(st.st_mode)) {
