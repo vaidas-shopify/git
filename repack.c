@@ -146,7 +146,7 @@ void existing_packs_collect(struct existing_packs *existing,
 		strbuf_addstr(&buf, base);
 		strbuf_strip_suffix(&buf, ".pack");
 
-		if ((extra_keep->nr > 0 && i < extra_keep->nr) || p->pack_keep)
+		if ((extra_keep->nr > 0 && i < extra_keep->nr) || p->pack_keep || p->is_anchored)
 			string_list_append(&existing->kept_packs, buf.buf);
 		else if (p->is_cruft)
 			string_list_append(&existing->cruft_packs, buf.buf);

@@ -464,6 +464,12 @@ void unlink_pack_path(const char *pack_name, int force_delete)
 			strbuf_release(&buf);
 			return;
 		}
+		strbuf_setlen(&buf, plen);
+		strbuf_addstr(&buf, ".anchored");
+		if (!access(buf.buf, F_OK)) {
+			strbuf_release(&buf);
+			return;
+		}
 	}
 
 	for (i = 0; i < ARRAY_SIZE(exts); i++) {

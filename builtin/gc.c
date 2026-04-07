@@ -491,7 +491,7 @@ static struct packed_git *find_base_packs(struct string_list *packs,
 	struct packed_git *p, *base = NULL;
 
 	repo_for_each_pack(the_repository, p) {
-		if (!p->pack_local || p->is_cruft)
+		if (!p->pack_local || p->is_cruft || p->is_anchored)
 			continue;
 		if (limit) {
 			if (p->pack_size >= limit)
