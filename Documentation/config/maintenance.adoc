@@ -133,3 +133,41 @@ maintenance.worktree-prune.auto::
 	negative value will force the task to run every time. Otherwise, a
 	positive value implies the command should run when the number of
 	prunable worktrees exceeds the value. The default value is 1.
+
+maintenance.anti-cruft.anchor::
+	A multi-valued config option specifying refs to use as anchors for
+	anti-cruft packs. Objects reachable from these refs (bounded by
+	`maintenance.anti-cruft.min-age`) are pinned into anti-cruft packs
+	that are protected from cruft expiration. Supports glob patterns
+	(e.g. `refs/heads/release/*`). The `anti-cruft` task is a no-op
+	if no anchors are configured. No default value.
+
+maintenance.anti-cruft.min-age::
+	An approxidate string controlling how old a commit must be before
+	its reachable objects are pinned. Only objects from commits older
+	than this threshold are included in anti-cruft packs. This prevents
+	pinning objects that are still in the active working set.
+	Defaults to `2.weeks.ago`.
+
+maintenance.anti-cruft.batch-size::
+	Maximum number of objects to pin per anchor ref per maintenance run.
+	When set to a positive value, the task pins at most this many objects
+	(oldest first) and records the last pinned commit so subsequent runs
+	continue where the previous batch left off. This bounds the cost of
+	the object enumeration walk and write amplification per run. A value
+	of `0` (the default) means no limit.
+
+maintenance.scoped-gc.expiration::
+	An approxidate string controlling the cruft expiration threshold
+	for the `scoped-gc` task. Unreachable objects in the young generation
+	older than this value are deleted. This is passed as
+	`--cruft-expiration` to linkgit:git-repack[1].
+	Defaults to `2.weeks.ago`.
+
+maintenance.scoped-gc.grace-period::
+	An approxidate string controlling how far behind anti-cruft pinning
+	can lag before `scoped-gc` skips its run. The task checks that each
+	anchor ref's last-pinned commit date is newer than the combined
+	threshold of `maintenance.anti-cruft.min-age` plus this grace period.
+	If any anchor's pinning frontier is older than this cutoff, scoped-gc
+	is skipped. Defaults to `1.week.ago`.

@@ -185,6 +185,47 @@ worktree-prune::
 	The `worktree-prune` task deletes stale or broken worktrees. See
 	linkgit:git-worktree[1] for more information.
 
+anti-cruft::
+	The `anti-cruft` task pins reachable objects from configured anchor
+	refs into separate "anti-cruft" packs. These packs form the "old
+	generation" in a generational garbage collection scheme: objects
+	pinned into anti-cruft packs are protected from cruft expiration
+	by subsequent `scoped-gc` runs.
++
+For each ref listed in `maintenance.anti-cruft.anchor`, the task
+resolves the ref, walks its history with `git rev-list --objects`
+(bounded by `maintenance.anti-cruft.min-age`), and packs the
+resulting objects into an anchored pack with an `.anchored` sidecar
+file. On subsequent runs, only objects newer than the last-pinned
+commit are walked, making the task incremental.
++
+The task also validates existing anti-cruft packs before creating new
+ones: if an anchor ref has been deleted or force-pushed past the
+recorded anchor commit, the corresponding pack is demoted to a regular
+pack by removing its `.anchored` file.
++
+The task requires at least one `maintenance.anti-cruft.anchor` to be
+configured; it is a no-op otherwise.
+
+scoped-gc::
+	The `scoped-gc` task performs lightweight garbage collection that
+	only processes unpinned (young generation) objects. Anti-cruft packs
+	are kept intact via `--keep-pack`, so the reachability walk and
+	repack only cover the young generation.
++
+Before running, the task checks that anti-cruft pinning has caught up
+sufficiently: for each configured anchor ref, the commit date of the
+last-pinned commit must be newer than the combined threshold of
+`maintenance.anti-cruft.min-age` plus
+`maintenance.scoped-gc.grace-period`. If pinning is lagging behind,
+the task is skipped because the young generation would still be too
+large for scoped-gc to save meaningful work over a full repack.
++
+This task is most useful on large repositories where a full `gc` is
+too expensive to run frequently. As anti-cruft progressively pins more
+of the old history, the young generation shrinks and scoped-gc becomes
+increasingly cheap.
+
 OPTIONS
 -------
 --auto::
