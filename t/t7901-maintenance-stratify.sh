@@ -60,6 +60,34 @@ extract_sidecar_anchor () {
 	EOF
 }
 
+# Overwrite the stratified_timestamp in a .base-stratum sidecar and
+# recompute its trailing checksum, so we can construct timestamps that
+# disagree with the natural commit-graph order.
+set_sidecar_timestamp () {
+	perl - "$1" "$2" <<-\EOF
+	use Digest::SHA;
+	my ($path, $new_ts) = @ARGV;
+	chmod 0644, $path or die "chmod $path: $!";
+	open my $fh, "+<:raw", $path or die "open $path: $!";
+	binmode $fh;
+	my $buf;
+	{ local $/; $buf = <$fh>; }
+	my $hash_id = unpack("N", substr($buf, 8, 4));
+	my $rawsz = ($hash_id == 1) ? 20 : 32;
+	my $algo = ($hash_id == 1) ? "sha1" : "sha256";
+	my $count = unpack("N", substr($buf, 12, 4));
+	substr($buf, 16 + $count * $rawsz, 4) = pack("N", $new_ts);
+	my $body_len = length($buf) - $rawsz;
+	my $sha = Digest::SHA->new($algo);
+	$sha->add(substr($buf, 0, $body_len));
+	substr($buf, $body_len, $rawsz) = $sha->digest;
+	seek $fh, 0, 0 or die;
+	print $fh $buf;
+	close $fh or die;
+	chmod 0444, $path;
+	EOF
+}
+
 test_expect_success 'two anchors at same commit get distinct packs' '
 	test_create_repo two-anchor-same-commit &&
 	(
@@ -175,6 +203,36 @@ test_expect_success 'batch-size smaller than a single commit still makes progres
 		extract_sidecar_anchor "$sc" >actual &&
 		echo "$c1_oid" >expect &&
 		test_cmp expect actual
+	)
+'
+
+test_expect_success 'stratify ignores pack.packSizeLimit and writes one self-contained pack' '
+	test_create_repo packsizelimit-anchor &&
+	(
+		cd packsizelimit-anchor &&
+
+		# pack-objects enforces a 1MB floor on pack.packSizeLimit, so
+		# the stratified content has to exceed it to risk a split: three
+		# incompressible ~700k blobs add up to ~2MB. If packSizeLimit
+		# leaked into the child pack-objects, the output would split into
+		# several base-stratum-prefixed packs (with several emitted
+		# hashes) and stratify would report success while writing no
+		# sidecar at all.
+		for i in 1 2 3
+		do
+			test-tool genrandom "blob$i" 700000 >big$i &&
+			git add big$i &&
+			git commit -q -m big$i || return 1
+		done &&
+
+		git config --add maintenance.stratified.anchor refs/heads/master &&
+		git config pack.packSizeLimit 1m &&
+
+		git maintenance run --task=stratify --no-quiet &&
+
+		# Exactly one base-stratum pack, with its sidecar.
+		test 1 -eq $(count_packs) &&
+		test 1 -eq $(count_sidecars)
 	)
 '
 
@@ -294,6 +352,64 @@ test_expect_success 'stratify advances through a merge using multi-bound frontie
 		test_grep "already fully stratified" err &&
 		! grep -i "incomparable" err &&
 		! grep "skipped.*objects already in base-stratum" err
+	)
+'
+
+test_expect_success PERL 'validate is robust to non-monotonic stratified_timestamp' '
+	test_create_repo cascade-bug &&
+	(
+		cd cascade-bug &&
+
+		# Two stratify runs with new commits in between produce
+		# two packs in the same anchor group:
+		#   P1 covers c1..c2 with anchor_commit=c2
+		#   P2 covers c3      with anchor_commit=c3
+		#
+		# Their stratified_timestamps naturally come out
+		# monotone (P2 strictly later than P1).
+		test_commit --no-tag c1 &&
+		test_commit --no-tag c2 &&
+
+		git config --add maintenance.stratified.anchor refs/heads/master &&
+		git maintenance run --task=stratify --quiet &&
+		test 1 -eq $(count_sidecars) &&
+		p1_sc=$(ls .git/objects/pack/*.base-stratum) &&
+		c2_oid=$(git rev-parse HEAD) &&
+
+		test_commit --no-tag c3 &&
+		git maintenance run --task=stratify --quiet &&
+		test 2 -eq $(count_sidecars) &&
+		p2_sc=$(ls .git/objects/pack/*.base-stratum |
+			grep -v -F -- "$p1_sc") &&
+
+		# Force the timestamp ordering to disagree with the
+		# commit-graph ordering: set P2 (anchor=c3) to a tiny
+		# timestamp so it sorts BEFORE P1 (anchor=c2).
+		# Cascade-by-timestamp would then validate P2 first,
+		# find it invalid against the rewound ref, and demote
+		# every later entry in sort order — which would include
+		# P1, the still-valid pack covering c1..c2.
+		set_sidecar_timestamp "$p2_sc" 1 &&
+
+		# Rewind master so c3 (P2 anchor) is unreachable but c2
+		# (P1 anchor) remains reachable.
+		git update-ref refs/heads/master "$c2_oid" &&
+
+		# Stratify runs validate first.
+		git maintenance run --task=stratify --no-quiet 2>err &&
+
+		# A buggy cascade would demote every pack in the group
+		# after the first invalid entry, regardless of whether
+		# those later entries are actually invalid; the per-anchor
+		# loop then re-stratifies from scratch and silently
+		# resurrects the same pack at the same path. The path /
+		# count assertions cannot tell the two regimes apart, so
+		# pin the diagnostic instead: independent validation
+		# never emits the "cascade-demoting" message.
+		test ! -f "$p2_sc" &&
+		test -f "$p1_sc" &&
+		test 1 -eq $(count_sidecars) &&
+		! grep "cascade-demoting" err
 	)
 '
 

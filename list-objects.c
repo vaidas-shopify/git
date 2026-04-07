@@ -65,6 +65,18 @@ static void process_blob(struct traversal_context *ctx,
 		return;
 
 	/*
+	 * When using kept packs as a traversal boundary, skip blobs
+	 * that are in kept packs — the closed-set property guarantees
+	 * they are already accounted for.
+	 */
+	if (ctx->revs->kept_pack_boundary &&
+	    has_object_kept_pack(ctx->revs->repo, &obj->oid,
+				ctx->revs->keep_pack_cache_flags)) {
+		obj->flags |= SEEN;
+		return;
+	}
+
+	/*
 	 * Pre-filter known-missing objects when explicitly requested.
 	 * Otherwise, a missing object error message may be reported
 	 * later (depending on other filtering criteria).
@@ -163,6 +175,18 @@ static void process_tree(struct traversal_context *ctx,
 		die("bad tree object");
 	if (obj->flags & (UNINTERESTING | SEEN))
 		return;
+
+	/*
+	 * When using kept packs as a traversal boundary, skip trees
+	 * that are in kept packs — the closed-set property guarantees
+	 * all objects under this tree are also in kept packs.
+	 */
+	if (revs->kept_pack_boundary &&
+	    has_object_kept_pack(revs->repo, &obj->oid,
+				revs->keep_pack_cache_flags)) {
+		obj->flags |= SEEN;
+		return;
+	}
 	if (revs->include_check_obj &&
 	    !revs->include_check_obj(&tree->object, revs->include_check_data))
 		return;

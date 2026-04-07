@@ -8,11 +8,10 @@ Traditional Git garbage collection walks all objects in the repository to
 determine reachability, then repacks everything. This cost scales with the
 total repository size and becomes prohibitive for large repositories.
 
-Stratified GC takes a different approach: stratify objects that are known to
-be reachable into long-lived "stratify" packs (the base stratum), then
-scope garbage collection to only the unstratified remainder (the young
-generation). This bounds GC cost to the size of the active stratum, not
-the total repository.
+Stratified GC takes a different approach: stratify objects that are known
+to be reachable into long-lived base-stratum packs, then scope garbage
+collection to only the unstratified remainder (the active stratum). This
+bounds GC cost to the size of the active stratum, not the total repository.
 
 ....
   Traditional GC:
@@ -20,7 +19,7 @@ the total repository.
     Cost: O(total repository)
 
   Stratified GC:
-    Pin objects reachable from stable refs -> base-stratum pack (old gen)
+    Stratify objects reachable from stable refs -> base-stratum pack
     GC walks only unstratified objects -> classify -> repack remainder
     Cost: O(unstratified objects)  <<  O(total repository)
 ....
@@ -144,8 +143,29 @@ For each base-stratum pack:
 Demotion means deleting the `.base-stratum` file. The pack becomes a regular
 pack and is handled by geometric repack on the next run.
 
-This is cheap: one ancestor check per base-stratum pack, accelerated to
-near-constant time by the commit graph.
+Independent validation
+^^^^^^^^^^^^^^^^^^^^^^
+
+Each base-stratum pack in an anchor ref's group is validated
+independently against the current ref tip. If a pack's recorded
+`anchor_commit` is no longer an ancestor of the ref (force-push, ref
+deletion), the pack's `.base-stratum` and `.keep` sidecars are removed.
+The `.pack` and `.idx` files stay on disk and are absorbed by the next
+geometric repack on its normal cadence; cascade-by-timestamp ordering is
+not used (it relied on a fragile assumption that
+`stratified_timestamp` order matches commit-graph order, which clock
+skew, manual sidecar edits, or future timestamp-inheriting code paths
+can break).
+
+After demotion, the stratify task re-stratifies from scratch on the
+next run. `find_stratified_ancestor()` consults this anchor's own
+base-stratum packs (if any survived the validation pass) for a `^bound`
+on the rev-list, so the walk only repeats the prefix that lost its
+pack.
+
+This is cheap: one ancestor check per base-stratum pack via
+`repo_in_merge_bases()`, accelerated to near-constant time by the
+commit graph.
 
 
 The surface-gc maintenance task
@@ -154,9 +174,12 @@ The surface-gc maintenance task
 The `surface-gc` task performs lightweight garbage collection scoped to the
 active stratum:
 
-1. Collects all base-stratum packs and passes them as `--keep-pack` to
-   `git repack`. The reachability walk traverses into kept packs to find
-   reachable objects, but does not rewrite them.
+1. Collects all base-stratum packs and passes them as `--keep-pack` with
+   `--kept-pack-boundary` to `git repack`. The reachability walk treats
+   kept packs as traversal boundaries: when the walk hits a commit, tree,
+   or blob in a kept pack, it stops traversing — it does not process
+   parents or recurse into trees. This is safe because of the closed-set
+   property (see below).
 2. Runs `git repack -d -l --cruft --cruft-expiration=<expiration>` on the
    remaining (unstratified) objects.
 3. Reachable unstratified objects are repacked into a new regular pack.
@@ -181,14 +204,32 @@ an anchor's history.
 Why surface-gc is cheap
 ~~~~~~~~~~~~~~~~~~~~~~
 
-The reachability walk terminates early when it hits objects in kept
-(stratify) packs. If main's history is stratified up to 2 weeks ago, the
-walk only needs to traverse approximately 2 weeks of commits before hitting
-stratified objects.
+Surface-gc passes `--kept-pack-boundary` to `git repack`, which tells
+`git pack-objects` to treat objects in kept (stratify) packs as
+traversal boundaries. When the revision walk encounters a commit in a
+kept pack, it skips parent processing entirely — no ancestors are queued.
+Similarly, when tree or blob traversal encounters an object in a kept
+pack, it marks it seen and does not recurse further.
+
+This relies on the *closed-set property*: for every configured
+anchor, the union of that anchor's own base-stratum packs is closed
+under reachability from its tip (down to the min-age window). Each
+pack is an incremental slice between two commits along the anchor's
+history, but the per-anchor union has no gaps. Across anchors the
+overall kept set is just the union of every anchor's coverage, and
+each anchor's coverage is independent of every other pack on disk.
+
+If main's history is stratified up to 2 weeks ago, the walk only needs to
+traverse approximately 2 weeks of commits before hitting stratified objects
+and stopping. Both enumeration and writing are bounded by the young
+generation size.
 
 ....
   Full GC walk depth:        entire history (years)
   Surface GC walk depth:      min-age window (weeks)
+
+  Full GC enumeration:       all objects
+  Surface GC enumeration:     only unstratified objects
 
   Full GC rewrite:           all objects
   Surface GC rewrite:         only unstratified objects

@@ -187,15 +187,15 @@ worktree-prune::
 
 stratify::
 	The `stratify` task stratifies reachable objects from configured anchor
-	refs into separate "stratify" packs. These packs form the "old
-	generation" in a Stratified garbage collection scheme: objects
-	stratified into base-stratum packs are protected from cruft expiration
-	by subsequent `surface-gc` runs.
+	refs into separate base-stratum packs. These packs form the base
+	stratum in a Stratified garbage collection scheme: objects stratified
+	into base-stratum packs are protected from cruft expiration by
+	subsequent `surface-gc` runs.
 +
 For each ref listed in `maintenance.stratified.anchor`, the task
 resolves the ref, walks its history with `git rev-list --objects`
 (bounded by `maintenance.stratified.min-age`), and packs the
-resulting objects into an base-stratum pack with an `.base-stratum` sidecar
+resulting objects into a base-stratum pack with a `.base-stratum` sidecar
 file. On subsequent runs, only objects newer than the last-stratified
 commit are walked, making the task incremental.
 +
