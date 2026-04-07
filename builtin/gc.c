@@ -1683,15 +1683,93 @@ out:
  * still exists and still descends from the recorded anchor commit.
  * Demote invalid packs by removing the .anchored file.
  */
+struct anchored_pack_entry {
+	struct packed_git *pack;
+	struct object_id anchor_commit;
+	char *anchor_ref;
+	uint32_t pinned_timestamp;
+};
+
+struct anchored_pack_group {
+	struct anchored_pack_entry *entries;
+	size_t nr;
+	size_t alloc;
+};
+
+static int cmp_anchored_entry_timestamp(const void *a_, const void *b_)
+{
+	const struct anchored_pack_entry *a = a_;
+	const struct anchored_pack_entry *b = b_;
+
+	if (a->pinned_timestamp < b->pinned_timestamp)
+		return -1;
+	if (a->pinned_timestamp > b->pinned_timestamp)
+		return 1;
+	return 0;
+}
+
+/*
+ * Validate a single anchored pack: check that the anchor ref exists
+ * and that the recorded anchor commit is an ancestor of the current
+ * ref tip. Returns 0 on success, nonzero on failure.
+ */
+static int validate_single_anchored_pack(struct repository *r,
+					  struct anchored_pack_entry *entry)
+{
+	struct object_id ref_oid;
+	struct child_process merge_base = CHILD_PROCESS_INIT;
+
+	if (!refs_resolve_ref_unsafe(get_main_ref_store(r),
+				     entry->anchor_ref,
+				     RESOLVE_REF_READING,
+				     &ref_oid, NULL)) {
+		warning(_("anti-cruft: anchor ref '%s' no longer exists, "
+			  "demoting pack %s"),
+			entry->anchor_ref, entry->pack->pack_name);
+		return -1;
+	}
+
+	merge_base.git_cmd = 1;
+	strvec_pushl(&merge_base.args, "merge-base", "--is-ancestor",
+		     oid_to_hex(&entry->anchor_commit),
+		     oid_to_hex(&ref_oid), NULL);
+	if (run_command(&merge_base)) {
+		warning(_("anti-cruft: anchor commit %s is not ancestor "
+			  "of %s tip, demoting pack %s"),
+			oid_to_hex(&entry->anchor_commit),
+			entry->anchor_ref, entry->pack->pack_name);
+		return -1;
+	}
+
+	return 0;
+}
+
+/*
+ * Validate all anti-cruft packs with cascade demotion.
+ *
+ * Anti-cruft packs for the same anchor ref form an incremental chain:
+ * each pack is created with ^<last_pinned> exclusion, so it depends on
+ * earlier packs for completeness. If a pack fails validation, all packs
+ * for the same anchor ref with equal or later pinned_timestamp must also
+ * be demoted to preserve the closed-set property.
+ */
 static void validate_anti_cruft_packs(void)
 {
 	struct packed_git *p;
 	struct repository *r = the_repository;
+	struct string_list ref_groups = STRING_LIST_INIT_DUP;
+	size_t i;
 
+	/*
+	 * Phase 1: collect anchored packs grouped by anchor_ref.
+	 * Each string_list entry's util points to an anchored_pack_group
+	 * that tracks its own nr/alloc for correct ALLOC_GROW behavior.
+	 */
 	repo_for_each_pack(r, p) {
 		struct anchored_data adata = { 0 };
-		struct object_id ref_oid;
-		struct child_process merge_base = CHILD_PROCESS_INIT;
+		struct string_list_item *item;
+		struct anchored_pack_group *group;
+		struct anchored_pack_entry *entry;
 
 		if (!p->is_anchored)
 			continue;
@@ -1702,37 +1780,53 @@ static void validate_anti_cruft_packs(void)
 			continue;
 		}
 
-		/* Check if the anchor ref still exists */
-		if (!refs_resolve_ref_unsafe(get_main_ref_store(r),
-					     adata.anchor_ref,
-					     RESOLVE_REF_READING,
-					     &ref_oid, NULL)) {
-			warning(_("anti-cruft: anchor ref '%s' no longer exists, "
-				  "demoting pack %s"),
-				adata.anchor_ref, p->pack_name);
-			remove_pack_anchored(p);
-			clear_anchored_data(&adata);
-			continue;
+		item = string_list_lookup(&ref_groups, adata.anchor_ref);
+		if (!item) {
+			item = string_list_insert(&ref_groups, adata.anchor_ref);
+			item->util = xcalloc(1, sizeof(struct anchored_pack_group));
 		}
 
-		/*
-		 * Check if the recorded anchor commit is an ancestor of
-		 * the current ref tip. Use merge-base --is-ancestor.
-		 */
-		merge_base.git_cmd = 1;
-		strvec_pushl(&merge_base.args, "merge-base", "--is-ancestor",
-			     oid_to_hex(&adata.anchor_commit),
-			     oid_to_hex(&ref_oid), NULL);
-		if (run_command(&merge_base)) {
-			warning(_("anti-cruft: anchor commit %s is not ancestor "
-				  "of %s tip, demoting pack %s"),
-				oid_to_hex(&adata.anchor_commit),
-				adata.anchor_ref, p->pack_name);
-			remove_pack_anchored(p);
-		}
+		group = item->util;
+		ALLOC_GROW(group->entries, group->nr + 1, group->alloc);
+		entry = &group->entries[group->nr++];
+		entry->pack = p;
+		oidcpy(&entry->anchor_commit, &adata.anchor_commit);
+		entry->anchor_ref = xstrdup(adata.anchor_ref);
+		entry->pinned_timestamp = adata.pinned_timestamp;
 
 		clear_anchored_data(&adata);
 	}
+
+	/*
+	 * Phase 2: for each anchor ref group, validate packs in
+	 * pinned_timestamp order. On first failure, cascade-demote
+	 * all subsequent packs in the group.
+	 */
+	for (i = 0; i < ref_groups.nr; i++) {
+		struct string_list_item *item = &ref_groups.items[i];
+		struct anchored_pack_group *group = item->util;
+		size_t j;
+		int cascade = 0;
+
+		QSORT(group->entries, group->nr, cmp_anchored_entry_timestamp);
+
+		for (j = 0; j < group->nr; j++) {
+			if (cascade || validate_single_anchored_pack(r, &group->entries[j])) {
+				if (!cascade)
+					warning(_("anti-cruft: cascade-demoting %zu remaining "
+						  "pack(s) for ref '%s'"),
+						group->nr - j - 1,
+						group->entries[j].anchor_ref);
+				cascade = 1;
+				remove_pack_anchored(group->entries[j].pack);
+			}
+			free(group->entries[j].anchor_ref);
+		}
+		free(group->entries);
+		free(group);
+	}
+
+	string_list_clear(&ref_groups, 0);
 }
 
 static struct object_id *find_last_pinned_commit(const char *anchor_ref)
@@ -2193,11 +2287,11 @@ static int maintenance_task_scoped_gc(struct maintenance_run_opts *opts,
 		strvec_push(&child.args, "--quiet");
 
 	/*
-	 * Keep all anti-cruft packs intact. The reachability walk
-	 * during repack will traverse into kept packs to find
-	 * reachable objects, but won't rewrite them. Objects in kept
-	 * packs serve as reachability "roots" — when the walk hits
-	 * an object in a kept pack, it knows it's reachable.
+	 * Keep all anti-cruft packs intact and treat them as traversal
+	 * boundaries. The closed-set property guarantees that every
+	 * object transitively reachable from an anchored object is also
+	 * in an anchored pack, so the reachability walk can stop when
+	 * it hits an object in a kept pack.
 	 */
 	repo_for_each_pack(r, p) {
 		if (!p->is_anchored)
@@ -2206,6 +2300,9 @@ static int maintenance_task_scoped_gc(struct maintenance_run_opts *opts,
 		strvec_pushf(&child.args, "--keep-pack=%s",
 			     pack_basename(p));
 	}
+
+	if (have_anchored)
+		strvec_push(&child.args, "--kept-pack-boundary");
 
 	/*
 	 * If no anti-cruft packs exist, this degrades to a normal

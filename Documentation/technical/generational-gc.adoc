@@ -144,6 +144,28 @@ For each anti-cruft pack:
 Demotion means deleting the `.anchored` file. The pack becomes a regular
 pack and is handled by geometric repack on the next run.
 
+Cascade demotion
+^^^^^^^^^^^^^^^^
+
+Anti-cruft packs for the same anchor ref form an incremental chain: each
+pack is created with `^<last_pinned>` exclusion, so it depends on earlier
+packs for objects that were already pinned. If a pack in the middle of
+the chain fails validation (e.g., the anchor ref was force-pushed), all
+packs for the same anchor ref with equal or later `pinned_timestamp` must
+also be demoted. Without cascade demotion, the surviving packs would have
+dangling references to objects that are now in the young generation,
+breaking the closed-set property.
+
+Validation processes packs grouped by anchor ref in `pinned_timestamp`
+order. On the first failure within a group, all remaining packs in that
+group are demoted. Different anchor refs are independent — a failure in
+one does not affect the other.
+
+After cascade demotion, the anti-cruft task starts pinning from scratch
+for that anchor ref. Scoped-gc skips its run until the pinning frontier
+passes the `min-age + grace-period` threshold again; regular geometric
+repack handles the young generation packs in the meantime.
+
 This is cheap: one ancestor check per anti-cruft pack, accelerated to
 near-constant time by the commit graph.
 
@@ -154,9 +176,12 @@ The scoped-gc maintenance task
 The `scoped-gc` task performs lightweight garbage collection scoped to the
 young generation:
 
-1. Collects all anti-cruft packs and passes them as `--keep-pack` to
-   `git repack`. The reachability walk traverses into kept packs to find
-   reachable objects, but does not rewrite them.
+1. Collects all anti-cruft packs and passes them as `--keep-pack` with
+   `--kept-pack-boundary` to `git repack`. The reachability walk treats
+   kept packs as traversal boundaries: when the walk hits a commit, tree,
+   or blob in a kept pack, it stops traversing — it does not process
+   parents or recurse into trees. This is safe because of the closed-set
+   property (see below).
 2. Runs `git repack -d -l --cruft --cruft-expiration=<expiration>` on the
    remaining (unpinned) objects.
 3. Reachable unpinned objects are repacked into a new regular pack.
@@ -181,14 +206,33 @@ an anchor's history.
 Why scoped-gc is cheap
 ~~~~~~~~~~~~~~~~~~~~~~
 
-The reachability walk terminates early when it hits objects in kept
-(anti-cruft) packs. If main's history is pinned up to 2 weeks ago, the
-walk only needs to traverse approximately 2 weeks of commits before hitting
-pinned objects.
+Scoped-gc passes `--kept-pack-boundary` to `git repack`, which tells
+`git pack-objects` to treat objects in kept (anti-cruft) packs as
+traversal boundaries. When the revision walk encounters a commit in a
+kept pack, it skips parent processing entirely — no ancestors are queued.
+Similarly, when tree or blob traversal encounters an object in a kept
+pack, it marks it seen and does not recurse further.
+
+This relies on the *closed-set property*: the union of all anti-cruft
+packs is closed under object reachability. Every object transitively
+reachable from an anchored object is guaranteed to be in some anchored
+pack, because anti-cruft packs are created by `rev-list --objects` which
+enumerates the full transitive closure. The `^<last_pinned>` exclusion
+means individual packs are not self-contained, but the union across all
+packs for an anchor ref is. Cascade demotion (see Validation above)
+preserves this property after force-pushes.
+
+If main's history is pinned up to 2 weeks ago, the walk only needs to
+traverse approximately 2 weeks of commits before hitting pinned objects
+and stopping. Both enumeration and writing are bounded by the young
+generation size.
 
 ....
   Full GC walk depth:        entire history (years)
   Scoped GC walk depth:      min-age window (weeks)
+
+  Full GC enumeration:       all objects
+  Scoped GC enumeration:     only unpinned objects
 
   Full GC rewrite:           all objects
   Scoped GC rewrite:         only unpinned objects

@@ -187,6 +187,7 @@ struct rev_info {
 			limited:1,
 			unpacked:1,
 			no_kept_objects:1,
+			kept_pack_boundary:1,
 			boundary:2,
 			count:1,
 			left_right:1,

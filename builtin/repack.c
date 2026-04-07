@@ -117,6 +117,7 @@ int cmd_repack(int argc,
 	const char *unpack_unreachable = NULL;
 	int keep_unreachable = 0;
 	struct string_list keep_pack_list = STRING_LIST_INIT_NODUP;
+	int kept_pack_boundary = 0;
 	struct pack_objects_args po_args = PACK_OBJECTS_ARGS_INIT;
 	struct pack_objects_args cruft_po_args = PACK_OBJECTS_ARGS_INIT;
 	int write_midx = 0;
@@ -183,6 +184,9 @@ int cmd_repack(int argc,
 				N_("repack objects in packs marked with .keep")),
 		OPT_STRING_LIST(0, "keep-pack", &keep_pack_list, N_("name"),
 				N_("do not repack this pack")),
+		OPT_BOOL_F(0, "kept-pack-boundary", &kept_pack_boundary,
+			   N_("treat kept packs as traversal boundary"),
+			   PARSE_OPT_HIDDEN),
 		OPT_INTEGER('g', "geometric", &geometry.split_factor,
 			    N_("find a geometric progression with factor <N>")),
 		OPT_BOOL('m', "write-midx", &write_midx,
@@ -279,6 +283,8 @@ int cmd_repack(int argc,
 	for (i = 0; i < keep_pack_list.nr; i++)
 		strvec_pushf(&cmd.args, "--keep-pack=%s",
 			     keep_pack_list.items[i].string);
+	if (kept_pack_boundary)
+		strvec_push(&cmd.args, "--kept-pack-boundary");
 	strvec_push(&cmd.args, "--non-empty");
 	if (!geometry.split_factor) {
 		/*
