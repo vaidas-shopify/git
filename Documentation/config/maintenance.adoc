@@ -133,3 +133,41 @@ maintenance.worktree-prune.auto::
 	negative value will force the task to run every time. Otherwise, a
 	positive value implies the command should run when the number of
 	prunable worktrees exceeds the value. The default value is 1.
+
+maintenance.stratified.anchor::
+	A multi-valued config option specifying refs to use as anchors for
+	base-stratum packs. Objects reachable from these refs (bounded by
+	`maintenance.stratified.min-age`) are stratified into base-stratum packs
+	that are protected from cruft expiration. Supports glob patterns
+	(e.g. `refs/heads/release/*`). The `stratify` task is a no-op
+	if no anchors are configured. No default value.
+
+maintenance.stratified.min-age::
+	An approxidate string controlling how old a commit must be before
+	its reachable objects are stratified. Only objects from commits older
+	than this threshold are included in base-stratum packs. This prevents
+	stratifying objects that are still in the active working set.
+	Defaults to `2.weeks.ago`.
+
+maintenance.stratified.batch-size::
+	Maximum number of objects to stratify per anchor ref per maintenance run.
+	When set to a positive value, the task stratifies at most this many objects
+	(oldest first) and records the last stratified commit so subsequent runs
+	continue where the previous batch left off. This bounds the cost of
+	the object enumeration walk and write amplification per run. A value
+	of `0` (the default) means no limit.
+
+maintenance.stratified.cruft-expiration::
+	An approxidate string controlling the cruft expiration threshold
+	for the `surface-gc` task. Unreachable objects in the active stratum
+	older than this value are deleted. This is passed as
+	`--cruft-expiration` to linkgit:git-repack[1].
+	Defaults to `2.weeks.ago`.
+
+maintenance.stratified.grace-period::
+	An approxidate string controlling how far behind stratify stratifying
+	can lag before `surface-gc` skips its run. The task checks that each
+	anchor ref's last-stratified commit date is newer than the combined
+	threshold of `maintenance.stratified.min-age` plus this grace period.
+	If any anchor's stratifying frontier is older than this cutoff, surface-gc
+	is skipped. Defaults to `1.week.ago`.

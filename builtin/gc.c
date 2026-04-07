@@ -1771,12 +1771,16 @@ static int maintenance_task_stratify(struct maintenance_run_opts *opts,
 	const struct string_list *anchors = NULL;
 	const char *min_age_str = "2.weeks.ago";
 	timestamp_t min_age_ts;
+	int batch_size = 0;
 	int result = 0;
 	size_t i;
 
 	if (repo_config_get_string_multi(r, "maintenance.stratified.anchor",
-					 &anchors))
-		return 0; /* no anchor refs configured */
+					 &anchors)) {
+		if (!opts->quiet)
+			fprintf(stderr, _("stratify: skipped, no anchor refs configured\n"));
+		return 0;
+	}
 
 	/* Validate existing base-stratum packs before stratifying new ones */
 	validate_stratify_packs();
@@ -1784,6 +1788,11 @@ static int maintenance_task_stratify(struct maintenance_run_opts *opts,
 	repo_config_get_string_tmp(r, "maintenance.stratified.min-age",
 				   &min_age_str);
 	min_age_ts = approxidate(min_age_str);
+
+	repo_config_get_int(r, "maintenance.stratified.batch-size",
+			    &batch_size);
+	if (batch_size < 0)
+		batch_size = 0;
 
 	for (i = 0; i < anchors->nr; i++) {
 		const char *anchor_ref = anchors->items[i].string;
@@ -1817,7 +1826,8 @@ static int maintenance_task_stratify(struct maintenance_run_opts *opts,
 		 * git rev-list --objects --before=<min-age> <tip> [^<last_stratified>]
 		 */
 		rev_list.git_cmd = 1;
-		strvec_pushl(&rev_list.args, "rev-list", "--objects", NULL);
+		strvec_pushl(&rev_list.args, "rev-list", "--objects",
+			     "--reverse", NULL);
 		strvec_pushf(&rev_list.args, "--before=%"PRItime, min_age_ts);
 		strvec_push(&rev_list.args, oid_to_hex(&tip_oid));
 		if (last_stratified)
@@ -1850,9 +1860,113 @@ static int maintenance_task_stratify(struct maintenance_run_opts *opts,
 
 		/* Nothing to stratify */
 		if (!rev_list_out.len) {
+			if (!opts->quiet) {
+				if (last_stratified)
+					fprintf(stderr,
+						_("stratify: '%s' already fully stratified at %s\n"),
+						anchor_ref, oid_to_hex(last_stratified));
+				else
+					fprintf(stderr,
+						_("stratify: no objects to stratify for '%s' (all newer than min-age)\n"),
+						anchor_ref);
+			}
 			strbuf_release(&rev_list_out);
 			free(last_stratified);
 			continue;
+		}
+
+		/*
+		 * If batch-size is set, truncate at a commit boundary
+		 * after reaching the limit. This ensures all objects
+		 * (trees, blobs) belonging to the last included commit
+		 * are packed together. Truncating mid-commit would leave
+		 * some objects unpacked but record the commit as stratified,
+		 * causing subsequent runs to skip them permanently via
+		 * ^<last_stratified>.
+		 *
+		 * With --reverse, oldest objects come first, so truncation
+		 * keeps the oldest batch and defers newer objects to
+		 * subsequent runs.
+		 *
+		 * Also find the last commit OID in the (possibly truncated)
+		 * output to use as the anchor commit in the .base-stratum
+		 * sidecar.
+		 *
+		 * rev-list --objects format:
+		 *   commits: "<hex>\n"
+		 *   trees/blobs: "<hex> <path>\n"
+		 */
+		{
+			const char *p = rev_list_out.buf;
+			int truncated = 0;
+			int obj_count = 0;
+			int batch_exceeded = 0;
+			struct object_id batch_anchor;
+			int have_batch_anchor = 0;
+			size_t last_commit_boundary = 0;
+
+			while (p < rev_list_out.buf + rev_list_out.len) {
+				const char *eol = memchr(p, '\n', rev_list_out.buf + rev_list_out.len - p);
+				if (!eol)
+					break;
+
+				/* Commit lines have no space (just hex OID) */
+				if (!memchr(p, ' ', eol - p)) {
+					/*
+					 * We hit a new commit. If we already
+					 * exceeded the batch limit, truncate
+					 * at the previous commit boundary so
+					 * all objects from the last included
+					 * commit are present.
+					 */
+					if (batch_exceeded) {
+						strbuf_setlen(&rev_list_out,
+							      last_commit_boundary);
+						truncated = 1;
+						break;
+					}
+					last_commit_boundary = p - rev_list_out.buf;
+					if (get_oid_hex(p, &batch_anchor) == 0)
+						have_batch_anchor = 1;
+				}
+
+				obj_count++;
+				eol++;
+				if (batch_size > 0 && obj_count >= batch_size)
+					batch_exceeded = 1;
+				p = eol;
+			}
+
+			/*
+			 * If we exceeded the batch but never hit another
+			 * commit to trigger truncation, all remaining
+			 * objects belong to the last commit — include them.
+			 */
+
+			/*
+			 * Always use the last commit in the rev-list output
+			 * as the anchor, not the ref tip. The rev-list is
+			 * bounded by --before=<min-age>, so the last commit
+			 * represents the actual stratified frontier. Using the
+			 * ref tip would skip objects that are currently newer
+			 * than min-age but will become eligible in future runs
+			 * as time passes.
+			 */
+			if (have_batch_anchor)
+				oidcpy(&tip_oid, &batch_anchor);
+
+			if (!opts->quiet) {
+				if (truncated)
+					fprintf(stderr,
+						_("stratify: stratified %d objects (batch limit) for '%s' at %s\n"),
+						obj_count, anchor_ref,
+						oid_to_hex(&tip_oid));
+				else
+					fprintf(stderr,
+						_("stratify: stratified %d objects for '%s' at %s\n"),
+						obj_count, anchor_ref,
+						oid_to_hex(&tip_oid));
+			}
 		}
 
 		/*
@@ -1950,6 +2064,106 @@ static int stratify_auto_condition(struct gc_config *cfg UNUSED)
  * intact via --keep-pack, so the reachability walk and repack only
  * cover the active stratum.
  */
+/*
+ * Check whether stratify stratifying has caught up sufficiently for
+ * surface-gc to be worthwhile. For each anchor ref, compare the
+ * commit date of the last-stratified commit against (now - min-age - grace).
+ * If stratifying is lagging behind by more than the grace period, the
+ * active stratum is still too large for surface-gc to save work.
+ */
+static int stratify_stratifying_caught_up(struct repository *r, int quiet)
+{
+	const struct string_list *anchors = NULL;
+	const char *min_age_str = "2.weeks.ago";
+	const char *grace_str = "1.week.ago";
+	timestamp_t now_ts, min_age_ts, grace_ts, cutoff_ts;
+	size_t i;
+
+	if (repo_config_get_string_multi(r, "maintenance.stratified.anchor",
+					 &anchors))
+		return 0;
+
+	repo_config_get_string_tmp(r, "maintenance.stratified.min-age",
+				   &min_age_str);
+	repo_config_get_string_tmp(r, "maintenance.stratified.grace-period",
+				   &grace_str);
+
+	/*
+	 * The cutoff is min-age + grace-period behind now.
+	 * Compute each as an offset from now and combine:
+	 *   cutoff = now - (now - min_age) - (now - grace)
+	 *          = now - min_age_offset - grace_offset
+	 */
+	now_ts = approxidate("now");
+	min_age_ts = approxidate(min_age_str);
+	grace_ts = approxidate(grace_str);
+	cutoff_ts = now_ts - (now_ts - min_age_ts) - (now_ts - grace_ts);
+
+	for (i = 0; i < anchors->nr; i++) {
+		const char *anchor_ref = anchors->items[i].string;
+		struct packed_git *p;
+		struct object_id *best_oid = NULL;
+		uint32_t best_ts = 0;
+		struct commit *commit;
+
+		/* Find the most recent stratified commit for this anchor */
+		repo_for_each_pack(r, p) {
+			struct base_stratum_data adata = { 0 };
+
+			if (!p->in_base_stratum)
+				continue;
+			if (load_pack_base_stratum(p, &adata))
+				continue;
+			if (!adata.anchor_ref ||
+			    strcmp(adata.anchor_ref, anchor_ref)) {
+				clear_base_stratum_data(&adata);
+				continue;
+			}
+			if (adata.stratified_timestamp > best_ts) {
+				free(best_oid);
+				best_oid = xmalloc(sizeof(*best_oid));
+				oidcpy(best_oid, &adata.anchor_commit);
+				best_ts = adata.stratified_timestamp;
+			}
+			clear_base_stratum_data(&adata);
+		}
+
+		if (!best_oid) {
+			if (!quiet)
+				fprintf(stderr,
+					_("surface-gc: anchor '%s' has no stratified commits yet\n"),
+					anchor_ref);
+			return 0;
+		}
+
+		commit = lookup_commit(r, best_oid);
+		free(best_oid);
+
+		if (!commit || repo_parse_commit(r, commit)) {
+			if (!quiet)
+				fprintf(stderr,
+					_("surface-gc: cannot parse stratified commit for '%s'\n"),
+					anchor_ref);
+			return 0;
+		}
+
+		if (commit->date < cutoff_ts) {
+			if (!quiet)
+				fprintf(stderr,
+					_("surface-gc: skipped, stratifying for '%s' is lagging "
+				  "(stratified up to %s [%s], need commits newer than "
+				  "stratify.min-age(%s) + surface-gc.grace-period(%s))\n"),
+				anchor_ref,
+				oid_to_hex(&commit->object.oid),
+				show_date(commit->date, 0, DATE_MODE(SHORT)),
+				min_age_str, grace_str);
+			return 0;
+		}
+	}
+
+	return 1;
+}
+
 static int maintenance_task_surface_gc(struct maintenance_run_opts *opts,
 				      struct gc_config *cfg UNUSED)
 {
@@ -1961,6 +2175,15 @@ static int maintenance_task_surface_gc(struct maintenance_run_opts *opts,
 
 	repo_config_get_string_tmp(r, "maintenance.stratified.cruft-expiration",
 				   &expiration);
+
+	/*
+	 * Check if stratify stratifying has caught up enough for
+	 * surface-gc to be effective. If stratifying is lagging behind,
+	 * the active stratum is still too large and surface-gc
+	 * would be as expensive as a full repack.
+	 */
+	if (!stratify_stratifying_caught_up(r, opts->quiet))
+		return 0;
 
 	child.git_cmd = 1;
 	strvec_pushl(&child.args, "repack", "-d", "-l", "--cruft", NULL);
