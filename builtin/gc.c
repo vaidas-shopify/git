@@ -1683,15 +1683,93 @@ out:
  * still exists and still descends from the recorded anchor commit.
  * Demote invalid packs by removing the .base-stratum file.
  */
+struct base_stratum_pack_entry {
+	struct packed_git *pack;
+	struct object_id anchor_commit;
+	char *anchor_ref;
+	uint32_t stratified_timestamp;
+};
+
+struct base_stratum_pack_group {
+	struct base_stratum_pack_entry *entries;
+	size_t nr;
+	size_t alloc;
+};
+
+static int cmp_base_stratum_entry_timestamp(const void *a_, const void *b_)
+{
+	const struct base_stratum_pack_entry *a = a_;
+	const struct base_stratum_pack_entry *b = b_;
+
+	if (a->stratified_timestamp < b->stratified_timestamp)
+		return -1;
+	if (a->stratified_timestamp > b->stratified_timestamp)
+		return 1;
+	return 0;
+}
+
+/*
+ * Validate a single base-stratum pack: check that the anchor ref exists
+ * and that the recorded anchor commit is an ancestor of the current
+ * ref tip. Returns 0 on success, nonzero on failure.
+ */
+static int validate_single_base_stratum_pack(struct repository *r,
+					  struct base_stratum_pack_entry *entry)
+{
+	struct object_id ref_oid;
+	struct child_process merge_base = CHILD_PROCESS_INIT;
+
+	if (!refs_resolve_ref_unsafe(get_main_ref_store(r),
+				     entry->anchor_ref,
+				     RESOLVE_REF_READING,
+				     &ref_oid, NULL)) {
+		warning(_("stratify: anchor ref '%s' no longer exists, "
+			  "demoting pack %s"),
+			entry->anchor_ref, entry->pack->pack_name);
+		return -1;
+	}
+
+	merge_base.git_cmd = 1;
+	strvec_pushl(&merge_base.args, "merge-base", "--is-ancestor",
+		     oid_to_hex(&entry->anchor_commit),
+		     oid_to_hex(&ref_oid), NULL);
+	if (run_command(&merge_base)) {
+		warning(_("stratify: anchor commit %s is not ancestor "
+			  "of %s tip, demoting pack %s"),
+			oid_to_hex(&entry->anchor_commit),
+			entry->anchor_ref, entry->pack->pack_name);
+		return -1;
+	}
+
+	return 0;
+}
+
+/*
+ * Validate all base-stratum packs with cascade demotion.
+ *
+ * Base-stratum packs for the same anchor ref form an incremental chain:
+ * each pack is created with ^<last_stratified> exclusion, so it depends on
+ * earlier packs for completeness. If a pack fails validation, all packs
+ * for the same anchor ref with equal or later stratified_timestamp must also
+ * be demoted to preserve the closed-set property.
+ */
 static void validate_stratify_packs(void)
 {
 	struct packed_git *p;
 	struct repository *r = the_repository;
+	struct string_list ref_groups = STRING_LIST_INIT_DUP;
+	size_t i;
 
+	/*
+	 * Phase 1: collect base-stratum packs grouped by anchor_ref.
+	 * Each string_list entry's util points to an base_stratum_pack_group
+	 * that tracks its own nr/alloc for correct ALLOC_GROW behavior.
+	 */
 	repo_for_each_pack(r, p) {
 		struct base_stratum_data adata = { 0 };
-		struct object_id ref_oid;
-		struct child_process merge_base = CHILD_PROCESS_INIT;
+		struct string_list_item *item;
+		struct base_stratum_pack_group *group;
+		struct base_stratum_pack_entry *entry;
 
 		if (!p->in_base_stratum)
 			continue;
@@ -1702,37 +1780,53 @@ static void validate_stratify_packs(void)
 			continue;
 		}
 
-		/* Check if the anchor ref still exists */
-		if (!refs_resolve_ref_unsafe(get_main_ref_store(r),
-					     adata.anchor_ref,
-					     RESOLVE_REF_READING,
-					     &ref_oid, NULL)) {
-			warning(_("stratify: anchor ref '%s' no longer exists, "
-				  "demoting pack %s"),
-				adata.anchor_ref, p->pack_name);
-			remove_pack_base_stratum(p);
-			clear_base_stratum_data(&adata);
-			continue;
+		item = string_list_lookup(&ref_groups, adata.anchor_ref);
+		if (!item) {
+			item = string_list_insert(&ref_groups, adata.anchor_ref);
+			item->util = xcalloc(1, sizeof(struct base_stratum_pack_group));
 		}
 
-		/*
-		 * Check if the recorded anchor commit is an ancestor of
-		 * the current ref tip. Use merge-base --is-ancestor.
-		 */
-		merge_base.git_cmd = 1;
-		strvec_pushl(&merge_base.args, "merge-base", "--is-ancestor",
-			     oid_to_hex(&adata.anchor_commit),
-			     oid_to_hex(&ref_oid), NULL);
-		if (run_command(&merge_base)) {
-			warning(_("stratify: anchor commit %s is not ancestor "
-				  "of %s tip, demoting pack %s"),
-				oid_to_hex(&adata.anchor_commit),
-				adata.anchor_ref, p->pack_name);
-			remove_pack_base_stratum(p);
-		}
+		group = item->util;
+		ALLOC_GROW(group->entries, group->nr + 1, group->alloc);
+		entry = &group->entries[group->nr++];
+		entry->pack = p;
+		oidcpy(&entry->anchor_commit, &adata.anchor_commit);
+		entry->anchor_ref = xstrdup(adata.anchor_ref);
+		entry->stratified_timestamp = adata.stratified_timestamp;
 
 		clear_base_stratum_data(&adata);
 	}
+
+	/*
+	 * Phase 2: for each anchor ref group, validate packs in
+	 * stratified_timestamp order. On first failure, cascade-demote
+	 * all subsequent packs in the group.
+	 */
+	for (i = 0; i < ref_groups.nr; i++) {
+		struct string_list_item *item = &ref_groups.items[i];
+		struct base_stratum_pack_group *group = item->util;
+		size_t j;
+		int cascade = 0;
+
+		QSORT(group->entries, group->nr, cmp_base_stratum_entry_timestamp);
+
+		for (j = 0; j < group->nr; j++) {
+			if (cascade || validate_single_base_stratum_pack(r, &group->entries[j])) {
+				if (!cascade)
+					warning(_("stratify: cascade-demoting %"PRIuMAX" remaining "
+						  "pack(s) for ref '%s'"),
+						(uintmax_t)(group->nr - j - 1),
+						group->entries[j].anchor_ref);
+				cascade = 1;
+				remove_pack_base_stratum(group->entries[j].pack);
+			}
+			free(group->entries[j].anchor_ref);
+		}
+		free(group->entries);
+		free(group);
+	}
+
+	string_list_clear(&ref_groups, 0);
 }
 
 static struct object_id *find_last_stratified_commit(const char *anchor_ref)
@@ -2059,7 +2153,7 @@ static int stratify_auto_condition(struct gc_config *cfg UNUSED)
 }
 
 /*
- * Scoped GC: lightweight garbage collection that only processes
+ * Surface GC: lightweight garbage collection that only processes
  * unstratified (active stratum) objects. Base-stratum packs are kept
  * intact via --keep-pack, so the reachability walk and repack only
  * cover the active stratum.
@@ -2193,11 +2287,11 @@ static int maintenance_task_surface_gc(struct maintenance_run_opts *opts,
 		strvec_push(&child.args, "--quiet");
 
 	/*
-	 * Keep all base-stratum packs intact. The reachability walk
-	 * during repack will traverse into kept packs to find
-	 * reachable objects, but won't rewrite them. Objects in kept
-	 * packs serve as reachability "roots" — when the walk hits
-	 * an object in a kept pack, it knows it's reachable.
+	 * Keep all base-stratum packs intact and treat them as traversal
+	 * boundaries. The closed-set property guarantees that every
+	 * object transitively reachable from a stratified object is also
+	 * in a base-stratum pack, so the reachability walk can stop when
+	 * it hits an object in a kept pack.
 	 */
 	repo_for_each_pack(r, p) {
 		if (!p->in_base_stratum)
@@ -2206,6 +2300,9 @@ static int maintenance_task_surface_gc(struct maintenance_run_opts *opts,
 		strvec_pushf(&child.args, "--keep-pack=%s",
 			     pack_basename(p));
 	}
+
+	if (have_base_stratum)
+		strvec_push(&child.args, "--kept-pack-boundary");
 
 	/*
 	 * If no base-stratum packs exist, this degrades to a normal

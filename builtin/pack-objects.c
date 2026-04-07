@@ -220,6 +220,7 @@ static int ignore_packed_keep_on_disk;
 static int ignore_packed_keep_in_core;
 static int ignore_packed_keep_in_core_open;
 static int ignore_packed_keep_in_core_has_cruft;
+static int kept_pack_boundary;
 static int allow_ofs_delta;
 static struct pack_idx_option pack_idx_opts;
 static const char *base_name;
@@ -4793,6 +4794,12 @@ static void get_object_list(struct rev_info *revs, struct strvec *argv)
 	save_commit_buffer = 0;
 	setup_revisions_from_strvec(argv, revs, &s_r_opt);
 
+	if (kept_pack_boundary) {
+		revs->kept_pack_boundary = 1;
+		revs->no_kept_objects = 1;
+		revs->keep_pack_cache_flags |= KEPT_PACK_IN_CORE;
+	}
+
 	/* make sure shallows are read */
 	is_repository_shallow(the_repository);
 
@@ -5084,6 +5091,9 @@ int cmd_pack_objects(int argc,
 			 N_("ignore packs that have companion .keep file")),
 		OPT_STRING_LIST(0, "keep-pack", &keep_pack_list, N_("name"),
 				N_("ignore this pack")),
+		OPT_BOOL_F(0, "kept-pack-boundary", &kept_pack_boundary,
+			   N_("treat kept packs as traversal boundary"),
+			   PARSE_OPT_HIDDEN),
 		OPT_INTEGER(0, "compression", &pack_compression_level,
 			    N_("pack compression level")),
 		OPT_BOOL(0, "keep-true-parents", &grafts_keep_true_parents,
