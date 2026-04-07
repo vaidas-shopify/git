@@ -138,9 +138,9 @@ maintenance.stratified.anchor::
 	A multi-valued config option specifying refs to use as anchors for
 	base-stratum packs. Objects reachable from these refs (bounded by
 	`maintenance.stratified.min-age`) are stratified into base-stratum packs
-	that are protected from cruft expiration. Supports glob patterns
-	(e.g. `refs/heads/release/*`). The `stratify` task is a no-op
-	if no anchors are configured. No default value.
+	that are protected from cruft expiration. Each value must be an
+	exact ref name (e.g. `refs/heads/main`). The `stratify` task is
+	a no-op if no anchors are configured. No default value.
 
 maintenance.stratified.min-age::
 	An approxidate string controlling how old a commit must be before
