@@ -1,0 +1,296 @@
+Generational Garbage Collection with Anti-Cruft Packs
+=====================================================
+
+Overview
+--------
+
+Traditional Git garbage collection walks all objects in the repository to
+determine reachability, then repacks everything. This cost scales with the
+total repository size and becomes prohibitive for large repositories.
+
+Generational GC takes a different approach: pin objects that are known to
+be reachable into long-lived "anti-cruft" packs (the old generation), then
+scope garbage collection to only the unpinned remainder (the young
+generation). This bounds GC cost to the size of the young generation, not
+the total repository.
+
+....
+  Traditional GC:
+    Walk ALL objects -> classify -> repack everything
+    Cost: O(total repository)
+
+  Generational GC:
+    Pin objects reachable from stable refs -> anti-cruft pack (old gen)
+    GC walks only unpinned objects -> classify -> repack remainder
+    Cost: O(unpinned objects)  <<  O(total repository)
+....
+
+
+Object classification
+---------------------
+
+Objects in a repository are classified into three tiers:
+
+Tier 1: Anti-cruft packs (old generation)::
+	Objects reachable from configured anchor refs, identified by an
+	`.anchored` sidecar file. GC treats these as reachable without
+	walking into them.
+
+Tier 2: Regular packs (young generation)::
+	Objects not yet pinned: recent commits, feature branches, fetched
+	objects. Managed by geometric repack and subject to scoped-gc
+	reachability walks.
+
+Tier 3: Cruft packs (unreachable, awaiting expiration)::
+	Objects proven unreachable during scoped GC. Same `.mtimes` mechanism
+	as today. Expired by cruft expiration.
+
+
+Anti-cruft packs
+----------------
+
+An anti-cruft pack is a standard packfile accompanied by an `.anchored`
+sidecar file that records the reachability proof.
+
+Anchor refs are user-configured refs that represent stable, long-lived
+history:
+
+----
+maintenance.anti-cruft.anchor = refs/heads/main
+maintenance.anti-cruft.anchor = refs/heads/release/v1
+----
+
+Only objects reachable from commits older than `maintenance.anti-cruft.min-age`
+(default: `2.weeks.ago`) are pinned. This avoids pinning objects from recent
+commits that might still be rewritten.
+
+.anchored file format
+~~~~~~~~~~~~~~~~~~~~~
+
+The `.anchored` file uses the following binary format (version 1):
+
+....
+Bytes 0-3:    signature (0x414e4348 = "ANCH", network byte order)
+Bytes 4-7:    version (1, network byte order)
+Bytes 8-11:   hash_id (1=SHA1, 2=SHA256, network byte order)
+Next N bytes: anchor_commit OID (raw, 20 or 32 bytes)
+Next 4 bytes: pinned_timestamp (network byte order)
+Next:         anchor_ref name (NUL-terminated string)
+Next N bytes: trailing checksum of all preceding data
+....
+
+The anchor commit and ref are recorded so the pack's reachability guarantee
+can be validated: if the anchor ref no longer points to a descendant of the
+anchor commit, the pack must be demoted back to a regular pack.
+
+Detection
+~~~~~~~~~
+
+Pack discovery checks for the `.anchored` sidecar the same way it checks for
+`.mtimes` to set `is_cruft`. The `packed_git` struct carries an `is_anchored`
+bit flag.
+
+Anti-cruft packs are included in the multi-pack-index like any other pack.
+No MIDX format changes are needed.
+
+
+The anti-cruft maintenance task
+-------------------------------
+
+The `anti-cruft` task incrementally pins objects from regular packs into
+anti-cruft packs. For each configured anchor ref, the task:
+
+1. Resolves the ref to a commit.
+2. Finds the last-pinned commit from existing `.anchored` files for that ref.
+3. Runs `git rev-list --objects --reverse --before=<min-age> <tip> [^<last_pinned>]`
+   to enumerate unpinned reachable objects.
+4. Feeds the object list to `git pack-objects` to create a new anti-cruft pack.
+5. Writes the `.anchored` sidecar, recording the last commit in the output
+   as the anchor commit (not the ref tip).
+
+The incremental walk bounded by `^<last_pinned>` means subsequent runs only
+process objects newer than what was previously pinned. The walk cost is
+proportional to the new objects, not the entire history.
+
+Batch size control
+~~~~~~~~~~~~~~~~~~
+
+The `maintenance.anti-cruft.batch-size` option (default: 0, unlimited) limits
+the number of objects pinned per anchor ref per run. With `--reverse`, oldest
+objects come first, so truncation pins the oldest batch and defers newer
+objects to subsequent runs.
+
+The `.anchored` sidecar records the last commit actually included in the
+batch (not the ref tip), so the next run's `^<last_pinned>` exclusion
+correctly continues from where the previous batch ended.
+
+This is important for the sliding time window: even without batch truncation,
+the anchor commit is always the last commit from the `--before=<min-age>`
+bounded output. As time passes and the min-age window advances, newly
+eligible commits appear between the recorded frontier and the new cutoff,
+and are picked up on the next run.
+
+Validation
+~~~~~~~~~~
+
+Before creating new anti-cruft packs, the task validates existing ones.
+For each anti-cruft pack:
+
+1. Load `.anchored` to get `anchor_ref` and `anchor_commit`.
+2. Resolve the anchor ref. If deleted, demote the pack.
+3. Check if `anchor_commit` is an ancestor of the current ref tip.
+   If not (history was rewritten), demote the pack.
+
+Demotion means deleting the `.anchored` file. The pack becomes a regular
+pack and is handled by geometric repack on the next run.
+
+This is cheap: one ancestor check per anti-cruft pack, accelerated to
+near-constant time by the commit graph.
+
+
+The scoped-gc maintenance task
+------------------------------
+
+The `scoped-gc` task performs lightweight garbage collection scoped to the
+young generation:
+
+1. Collects all anti-cruft packs and passes them as `--keep-pack` to
+   `git repack`. The reachability walk traverses into kept packs to find
+   reachable objects, but does not rewrite them.
+2. Runs `git repack -d -l --cruft --cruft-expiration=<expiration>` on the
+   remaining (unpinned) objects.
+3. Reachable unpinned objects are repacked into a new regular pack.
+   Unreachable objects go into a cruft pack. Expired unreachable objects
+   are dropped.
+
+Readiness check
+~~~~~~~~~~~~~~~
+
+Before running, scoped-gc verifies that anti-cruft pinning has caught up
+sufficiently. For each configured anchor ref, the commit date of the
+last-pinned commit must be newer than the combined threshold of
+`maintenance.anti-cruft.min-age` plus `maintenance.scoped-gc.grace-period`
+(default: `1.week.ago`).
+
+If any anchor's pinning frontier is older than this cutoff, scoped-gc is
+skipped. The young generation would still be too large for scoped-gc to
+save meaningful work over a full repack. This is particularly relevant
+when `batch-size` is set and anti-cruft needs multiple runs to fully pin
+an anchor's history.
+
+Why scoped-gc is cheap
+~~~~~~~~~~~~~~~~~~~~~~
+
+The reachability walk terminates early when it hits objects in kept
+(anti-cruft) packs. If main's history is pinned up to 2 weeks ago, the
+walk only needs to traverse approximately 2 weeks of commits before hitting
+pinned objects.
+
+....
+  Full GC walk depth:        entire history (years)
+  Scoped GC walk depth:      min-age window (weeks)
+
+  Full GC rewrite:           all objects
+  Scoped GC rewrite:         only unpinned objects
+....
+
+
+Integration with geometric repack
+----------------------------------
+
+Geometric repack skips anti-cruft packs the same way it already skips cruft
+packs. Anti-cruft packs are excluded from the geometric merge sequence and
+survive geometric repack unchanged.
+
+
+Configuration
+-------------
+
+maintenance.anti-cruft.anchor::
+	Multi-valued. Refs to use as anchors for anti-cruft packs. Each
+	value must be an exact ref name. The `anti-cruft` task is a no-op
+	if no anchors are configured. No default.
+
+maintenance.anti-cruft.min-age::
+	Approxidate. Only pin objects from commits older than this.
+	Default: `2.weeks.ago`.
+
+maintenance.anti-cruft.batch-size::
+	Integer. Maximum objects to pin per anchor per run. `0` means
+	unlimited. Default: `0`.
+
+maintenance.scoped-gc.expiration::
+	Approxidate. Cruft expiration threshold for scoped-gc. Passed as
+	`--cruft-expiration` to linkgit:git-repack[1].
+	Default: `2.weeks.ago`.
+
+maintenance.scoped-gc.grace-period::
+	Approxidate. How far behind anti-cruft pinning can lag before
+	scoped-gc skips its run. The actual cutoff is `min-age` plus this
+	value. Default: `1.week.ago`.
+
+
+Steady-state behavior
+---------------------
+
+....
+Week 1, Day 1:
+  geometric-repack merges small regular packs (same as today)
+  anti-cruft task pins objects reachable from main (>2 weeks old)
+  -> first anti-cruft pack created
+
+Week 1, Day 2-6:
+  geometric-repack continues managing regular packs
+  anti-cruft task incrementally pins new objects crossing min-age
+  -> anti-cruft packs grow (or new small ones created)
+
+Week 1, Day 7:
+  scoped-gc runs:
+  -> walks only unpinned objects (recent history)
+  -> unreachable unpinned objects -> cruft pack
+  -> expired cruft -> dropped
+  -> cost: proportional to ~2 weeks of history, not years
+
+Week 2+:
+  anti-cruft packs ~ all of main's reachable history
+  regular packs ~ last 2 weeks of objects
+  cruft packs ~ 0-2 weeks of unreachable objects
+  scoped-gc cost ~ constant (bounded by min-age window)
+....
+
+
+Safety properties
+-----------------
+
+The system is safe as long as validation is conservative (demote on any
+doubt):
+
+* A wrongly-demoted anti-cruft pack becomes a regular pack. Its objects
+  are subject to normal GC, which correctly classifies them.
+* An anti-cruft pack is never trusted beyond its anchor ref.
+* Force-push on main demotes anti-cruft packs for main. The next GC
+  correctly identifies newly-unreachable objects.
+* A periodic full GC can serve as a safety net to catch any objects that
+  might have been incorrectly retained.
+
+
+Risks and trade-offs
+--------------------
+
+Delta compression across generations::
+	Objects in anti-cruft packs are delta-compressed within the pack.
+	Objects in regular packs cannot delta against anti-cruft pack objects
+	(different pack-objects invocation). This may increase total size
+	slightly vs. a single full repack. The cross-pack delta loss is bounded
+	by the young generation size.
+
+Anti-cruft pack proliferation::
+	Each anchor ref per run could create a new small anti-cruft pack.
+	Mitigation: merge small anti-cruft packs using the same geometric
+	progression, or accumulate into a single pack per anchor ref.
+
+Correctness of the skip optimization::
+	When scoped-gc keeps anti-cruft packs via `--keep-pack`, it assumes
+	every object in those packs is reachable. If validation misses a case
+	where this is not true, unreachable objects could survive indefinitely.
+	Mitigation: periodic full GC as a safety net.

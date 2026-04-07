@@ -138,9 +138,9 @@ maintenance.anti-cruft.anchor::
 	A multi-valued config option specifying refs to use as anchors for
 	anti-cruft packs. Objects reachable from these refs (bounded by
 	`maintenance.anti-cruft.min-age`) are pinned into anti-cruft packs
-	that are protected from cruft expiration. Supports glob patterns
-	(e.g. `refs/heads/release/*`). The `anti-cruft` task is a no-op
-	if no anchors are configured. No default value.
+	that are protected from cruft expiration. Each value must be an
+	exact ref name (e.g. `refs/heads/main`). The `anti-cruft` task is
+	a no-op if no anchors are configured. No default value.
 
 maintenance.anti-cruft.min-age::
 	An approxidate string controlling how old a commit must be before
