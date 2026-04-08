@@ -265,6 +265,7 @@ enum maintenance_task_label {
 	TASK_WORKTREE_PRUNE,
 	TASK_RERERE_GC,
 	TASK_STRATIFY,
+	TASK_CONSOLIDATE_STRATUM,
 	TASK_SURFACE_GC,
 
 	/* Leave as final value */
@@ -1753,18 +1754,16 @@ static int validate_single_base_stratum_pack(struct repository *r,
  * for the same anchor ref with equal or later stratified_timestamp must also
  * be demoted to preserve the closed-set property.
  */
-static void validate_stratify_packs(void)
+/*
+ * Collect all base-stratum packs, grouped by anchor_ref.
+ * Each string_list entry's util points to an base_stratum_pack_group.
+ * Packs whose .base-stratum file cannot be loaded are demoted and skipped.
+ */
+static void collect_base_stratum_pack_groups(struct repository *r,
+					 struct string_list *ref_groups)
 {
 	struct packed_git *p;
-	struct repository *r = the_repository;
-	struct string_list ref_groups = STRING_LIST_INIT_DUP;
-	size_t i;
 
-	/*
-	 * Phase 1: collect base-stratum packs grouped by anchor_ref.
-	 * Each string_list entry's util points to an base_stratum_pack_group
-	 * that tracks its own nr/alloc for correct ALLOC_GROW behavior.
-	 */
 	repo_for_each_pack(r, p) {
 		struct base_stratum_data adata = { 0 };
 		struct string_list_item *item;
@@ -1780,9 +1779,9 @@ static void validate_stratify_packs(void)
 			continue;
 		}
 
-		item = string_list_lookup(&ref_groups, adata.anchor_ref);
+		item = string_list_lookup(ref_groups, adata.anchor_ref);
 		if (!item) {
-			item = string_list_insert(&ref_groups, adata.anchor_ref);
+			item = string_list_insert(ref_groups, adata.anchor_ref);
 			item->util = xcalloc(1, sizeof(struct base_stratum_pack_group));
 		}
 
@@ -1796,9 +1795,34 @@ static void validate_stratify_packs(void)
 
 		clear_base_stratum_data(&adata);
 	}
+}
+
+static void free_base_stratum_pack_groups(struct string_list *ref_groups)
+{
+	size_t i;
+
+	for (i = 0; i < ref_groups->nr; i++) {
+		struct base_stratum_pack_group *group = ref_groups->items[i].util;
+		size_t j;
+
+		for (j = 0; j < group->nr; j++)
+			free(group->entries[j].anchor_ref);
+		free(group->entries);
+		free(group);
+	}
+	string_list_clear(ref_groups, 0);
+}
+
+static void validate_stratify_packs(void)
+{
+	struct repository *r = the_repository;
+	struct string_list ref_groups = STRING_LIST_INIT_DUP;
+	size_t i;
+
+	collect_base_stratum_pack_groups(r, &ref_groups);
 
 	/*
-	 * Phase 2: for each anchor ref group, validate packs in
+	 * For each anchor ref group, validate packs in
 	 * stratified_timestamp order. On first failure, cascade-demote
 	 * all subsequent packs in the group.
 	 */
@@ -1820,13 +1844,10 @@ static void validate_stratify_packs(void)
 				cascade = 1;
 				remove_pack_base_stratum(group->entries[j].pack);
 			}
-			free(group->entries[j].anchor_ref);
 		}
-		free(group->entries);
-		free(group);
 	}
 
-	string_list_clear(&ref_groups, 0);
+	free_base_stratum_pack_groups(&ref_groups);
 }
 
 static struct object_id *find_last_stratified_commit(const char *anchor_ref)
@@ -2153,6 +2174,217 @@ static int stratify_auto_condition(struct gc_config *cfg UNUSED)
 }
 
 /*
+ * Consolidate base-stratum packs: apply geometric repacking within
+ * each anchor ref's pack set to bound the number of base-stratum packs.
+ */
+static int maintenance_task_consolidate_stratum(
+		struct maintenance_run_opts *opts,
+		struct gc_config *cfg UNUSED)
+{
+	struct repository *r = the_repository;
+	struct string_list ref_groups = STRING_LIST_INIT_DUP;
+	int split_factor = 2;
+	int result = 0;
+	size_t i;
+
+	repo_config_get_int(r, "maintenance.consolidate-stratify.splitfactor",
+			    &split_factor);
+	if (split_factor < 2)
+		split_factor = 2;
+
+	collect_base_stratum_pack_groups(r, &ref_groups);
+
+	for (i = 0; i < ref_groups.nr; i++) {
+		struct base_stratum_pack_group *group = ref_groups.items[i].util;
+		struct packed_git **packs;
+		uint32_t split, j;
+		struct object_id best_anchor;
+		uint32_t best_timestamp = 0;
+		const char *anchor_ref = ref_groups.items[i].string;
+		struct child_process pack_proc = CHILD_PROCESS_INIT;
+		struct strbuf pack_hash = STRBUF_INIT;
+		char *pack_prefix, *pack_path;
+		struct packed_git *new_pack;
+
+		if (group->nr < 2)
+			continue;
+
+		/* Build array sorted by object count (ascending) */
+		ALLOC_ARRAY(packs, group->nr);
+		for (j = 0; j < group->nr; j++)
+			packs[j] = group->entries[j].pack;
+		QSORT(packs, group->nr, pack_geometry_cmp);
+
+		split = compute_pack_geometry_split(packs, group->nr,
+						    split_factor);
+		if (split < 2) {
+			free(packs);
+			continue;
+		}
+
+		/*
+		 * Find the latest anchor metadata among packs to merge.
+		 * The merged pack covers the full stratified range, so use the
+		 * latest stratified commit and timestamp.
+		 */
+		for (j = 0; j < group->nr; j++) {
+			struct base_stratum_pack_entry *e = &group->entries[j];
+			size_t k;
+			int below_split = 0;
+
+			for (k = 0; k < split; k++) {
+				if (packs[k] == e->pack) {
+					below_split = 1;
+					break;
+				}
+			}
+			if (below_split && e->stratified_timestamp > best_timestamp) {
+				best_timestamp = e->stratified_timestamp;
+				oidcpy(&best_anchor, &e->anchor_commit);
+			}
+		}
+
+		/*
+		 * Merge packs below the split using pack-objects --stdin-packs.
+		 * Positive basenames are included, ^-prefixed ones excluded.
+		 */
+		pack_proc.git_cmd = 1;
+		strvec_push(&pack_proc.args, "pack-objects");
+		if (opts->quiet)
+			strvec_push(&pack_proc.args, "--quiet");
+		else
+			strvec_push(&pack_proc.args, "--no-quiet");
+		strvec_push(&pack_proc.args, "--stdin-packs");
+		strvec_pushf(&pack_proc.args, "%s/pack/base-stratum",
+			     r->objects->sources->path);
+
+		pack_proc.in = -1;
+		pack_proc.out = -1;
+
+		if (start_command(&pack_proc)) {
+			warning(_("consolidate-stratify: failed to start "
+				  "pack-objects for '%s'"), anchor_ref);
+			free(packs);
+			result = 1;
+			continue;
+		}
+
+		{
+			struct strbuf stdin_buf = STRBUF_INIT;
+
+			/*
+			 * Only feed below-split packs as positive entries.
+			 * Do NOT ^-exclude above-split packs: base-stratum packs
+			 * must maintain the closed-set property (all objects
+			 * reachable from the anchor are present). Excluding
+			 * objects that also appear in above-split packs would
+			 * break this if cascade demotion later removes those
+			 * packs.
+			 */
+			for (j = 0; j < split; j++)
+				strbuf_addf(&stdin_buf, "%s\n",
+					    pack_basename(packs[j]));
+			write_in_full(pack_proc.in, stdin_buf.buf,
+				      stdin_buf.len);
+			strbuf_release(&stdin_buf);
+			close(pack_proc.in);
+		}
+
+		strbuf_read(&pack_hash, pack_proc.out, the_hash_algo->hexsz);
+		close(pack_proc.out);
+		strbuf_trim_trailing_newline(&pack_hash);
+
+		if (finish_command(&pack_proc) || !pack_hash.len) {
+			if (pack_hash.len)
+				warning(_("consolidate-stratify: pack-objects "
+					  "failed for '%s'"), anchor_ref);
+			strbuf_release(&pack_hash);
+			free(packs);
+			result = 1;
+			continue;
+		}
+
+		/* Write .base-stratum sidecar for the new merged pack */
+		pack_prefix = xstrfmt("%s/pack/base-stratum-%s",
+				      r->objects->sources->path,
+				      pack_hash.buf);
+		pack_path = xstrfmt("%s.idx", pack_prefix);
+		new_pack = add_packed_git(r, pack_path, strlen(pack_path), 1);
+		free(pack_path);
+		free(pack_prefix);
+		strbuf_release(&pack_hash);
+		if (!new_pack) {
+			/*
+			 * The merged pack was written but we cannot stat
+			 * its .pack file. Leave the source packs in place
+			 * so the anchor's objects remain reachable through
+			 * a recognized base-stratum pack; the orphaned
+			 * pack-objects output (if any) is harmless and can
+			 * be cleaned up by a later run.
+			 */
+			warning(_("consolidate-stratify: failed to register "
+				  "merged pack for '%s'; keeping source packs"),
+				anchor_ref);
+			free(packs);
+			result = 1;
+			continue;
+		}
+		write_pack_base_stratum(new_pack, &best_anchor,
+				    anchor_ref, best_timestamp);
+		new_pack->in_base_stratum = 1;
+
+		/* Remove the old packs that were merged */
+		{
+			char *packdir = mkpathdup("%s/pack",
+						  r->objects->sources->path);
+
+			for (j = 0; j < split; j++) {
+				struct strbuf base = STRBUF_INIT;
+
+				strbuf_addstr(&base, pack_basename(packs[j]));
+				strbuf_strip_suffix(&base, ".pack");
+				repack_remove_redundant_pack(r, packdir,
+							     base.buf);
+				strbuf_release(&base);
+			}
+			free(packdir);
+		}
+
+		free(packs);
+	}
+
+	free_base_stratum_pack_groups(&ref_groups);
+	return result;
+}
+
+static int consolidate_stratum_auto_condition(struct gc_config *cfg UNUSED)
+{
+	struct repository *r = the_repository;
+	struct string_list ref_groups = STRING_LIST_INIT_DUP;
+	int threshold = 0;
+	int should_run = 0;
+	size_t i;
+
+	repo_config_get_int(r, "maintenance.consolidate-stratify.auto",
+			    &threshold);
+	if (!threshold)
+		return 0;
+	if (threshold < 0)
+		return 1;
+
+	collect_base_stratum_pack_groups(r, &ref_groups);
+	for (i = 0; i < ref_groups.nr; i++) {
+		struct base_stratum_pack_group *group = ref_groups.items[i].util;
+		if (group->nr >= (size_t)threshold) {
+			should_run = 1;
+			break;
+		}
+	}
+	free_base_stratum_pack_groups(&ref_groups);
+	return should_run;
+}
+
+/*
  * Surface GC: lightweight garbage collection that only processes
  * unstratified (active stratum) objects. Base-stratum packs are kept
  * intact via --keep-pack, so the reachability walk and repack only
@@ -2424,6 +2656,11 @@ static const struct maintenance_task tasks[] = {
 		.background = maintenance_task_stratify,
 		.auto_condition = stratify_auto_condition,
 	},
+	[TASK_CONSOLIDATE_STRATUM] = {
+		.name = "consolidate-stratum",
+		.background = maintenance_task_consolidate_stratum,
+		.auto_condition = consolidate_stratum_auto_condition,
+	},
 	[TASK_SURFACE_GC] = {
 		.name = "surface-gc",
 		.background = maintenance_task_surface_gc,
@@ -2599,6 +2836,10 @@ static const struct maintenance_strategy geometric_strategy = {
 			.schedule = SCHEDULE_WEEKLY,
 		},
 		[TASK_STRATIFY] = {
+			.type = MAINTENANCE_TYPE_SCHEDULED | MAINTENANCE_TYPE_MANUAL,
+			.schedule = SCHEDULE_DAILY,
+		},
+		[TASK_CONSOLIDATE_STRATUM] = {
 			.type = MAINTENANCE_TYPE_SCHEDULED | MAINTENANCE_TYPE_MANUAL,
 			.schedule = SCHEDULE_DAILY,
 		},

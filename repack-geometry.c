@@ -6,14 +6,14 @@
 #include "hex.h"
 #include "packfile.h"
 
-static uint32_t pack_geometry_weight(struct packed_git *p)
+uint32_t pack_geometry_weight(struct packed_git *p)
 {
 	if (open_pack_index(p))
 		die(_("cannot open index for %s"), p->pack_name);
 	return p->num_objects;
 }
 
-static int pack_geometry_cmp(const void *va, const void *vb)
+int pack_geometry_cmp(const void *va, const void *vb)
 {
 	uint32_t aw = pack_geometry_weight(*(struct packed_git **)va),
 		 bw = pack_geometry_weight(*(struct packed_git **)vb);
@@ -90,8 +90,8 @@ void pack_geometry_init(struct pack_geometry *geometry,
 	strbuf_release(&buf);
 }
 
-static uint32_t compute_pack_geometry_split(struct packed_git **pack, size_t pack_nr,
-					    int split_factor)
+uint32_t compute_pack_geometry_split(struct packed_git **pack, size_t pack_nr,
+				     int split_factor)
 {
 	uint32_t i;
 	uint32_t split;
