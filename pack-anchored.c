@@ -8,12 +8,22 @@
 #include "strbuf.h"
 #include "wrapper.h"
 
-static char *pack_anchored_filename(struct packed_git *p)
+static size_t pack_base_len(struct packed_git *p)
 {
 	size_t len;
 	if (!strip_suffix(p->pack_name, ".pack", &len))
 		BUG("pack_name does not end in .pack");
-	return xstrfmt("%.*s.anchored", (int)len, p->pack_name);
+	return len;
+}
+
+static char *pack_anchored_filename(struct packed_git *p)
+{
+	return xstrfmt("%.*s.anchored", (int)pack_base_len(p), p->pack_name);
+}
+
+static char *pack_keep_filename(struct packed_git *p)
+{
+	return xstrfmt("%.*s.keep", (int)pack_base_len(p), p->pack_name);
 }
 
 /*
@@ -191,6 +201,17 @@ int write_pack_anchored(struct packed_git *p,
 	finalize_hashfile(f, NULL, FSYNC_COMPONENT_PACK_METADATA,
 			  CSUM_HASH_IN_STREAM | CSUM_CLOSE | CSUM_FSYNC);
 
+	/*
+	 * Write a .keep file so that older git versions (unaware of
+	 * .anchored) will not delete this pack during gc or repack.
+	 */
+	{
+		char *keep_name = pack_keep_filename(p);
+		int keep_fd = xopen(keep_name, O_WRONLY | O_CREAT | O_TRUNC, 0444);
+		close(keep_fd);
+		free(keep_name);
+	}
+
 	free(anchored_name);
 	return 0;
 }
@@ -198,12 +219,19 @@ int write_pack_anchored(struct packed_git *p,
 int remove_pack_anchored(struct packed_git *p)
 {
 	char *anchored_name = pack_anchored_filename(p);
+	char *keep_name;
 	int ret = unlink(anchored_name);
 	if (ret) {
 		error_errno(_("failed to remove %s"), anchored_name);
 		free(anchored_name);
 		return -1;
 	}
+
+	/* Remove the companion .keep file created for older git compat */
+	keep_name = pack_keep_filename(p);
+	unlink(keep_name); /* best-effort, may not exist */
+	free(keep_name);
+
 	free(anchored_name);
 	p->is_anchored = 0;
 	return 0;
