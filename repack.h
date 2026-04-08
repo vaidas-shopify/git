@@ -116,6 +116,11 @@ void pack_geometry_repack_promisors(struct repository *repo,
 				    struct string_list *names,
 				    const char *packtmp);
 
+uint32_t pack_geometry_weight(struct packed_git *p);
+int pack_geometry_cmp(const void *va, const void *vb);
+uint32_t compute_pack_geometry_split(struct packed_git **pack, size_t pack_nr,
+				     int split_factor);
+
 void pack_geometry_init(struct pack_geometry *geometry,
 			struct existing_packs *existing,
 			const struct pack_objects_args *args);
