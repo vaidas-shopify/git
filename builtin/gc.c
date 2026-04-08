@@ -1879,6 +1879,89 @@ static struct object_id *find_last_stratified_commit(const char *anchor_ref)
 	return best;
 }
 
+/*
+ * Filter OIDs from rev_list_out that already exist in base-stratum packs
+ * for the given anchor_ref. This prevents creating packs with objects
+ * that are already in prior base-stratum packs, making each pack truly
+ * incremental.
+ *
+ * Returns the number of OIDs filtered out.
+ */
+static size_t filter_already_packed_oids(struct strbuf *rev_list_out,
+					 const char *anchor_ref)
+{
+	struct packed_git **existing = NULL;
+	size_t existing_nr = 0, existing_alloc = 0;
+	struct packed_git *p;
+	struct strbuf filtered = STRBUF_INIT;
+	const char *cur, *end;
+	size_t filtered_count = 0;
+
+	/* Collect base-stratum packs for this anchor ref */
+	repo_for_each_pack(the_repository, p) {
+		struct base_stratum_data adata = { 0 };
+
+		if (!p->in_base_stratum)
+			continue;
+		if (load_pack_base_stratum(p, &adata))
+			continue;
+		if (!adata.anchor_ref || strcmp(adata.anchor_ref, anchor_ref)) {
+			clear_base_stratum_data(&adata);
+			continue;
+		}
+		clear_base_stratum_data(&adata);
+
+		if (open_pack_index(p))
+			continue;
+
+		ALLOC_GROW(existing, existing_nr + 1, existing_alloc);
+		existing[existing_nr++] = p;
+	}
+
+	if (!existing_nr) {
+		free(existing);
+		return 0;
+	}
+
+	cur = rev_list_out->buf;
+	end = rev_list_out->buf + rev_list_out->len;
+
+	while (cur < end) {
+		const char *eol = memchr(cur, '\n', end - cur);
+		size_t line_len;
+		struct object_id oid;
+		int found = 0;
+
+		if (!eol)
+			break;
+		line_len = eol + 1 - cur;
+
+		if (!get_oid_hex(cur, &oid)) {
+			size_t k;
+			for (k = 0; k < existing_nr; k++) {
+				if (find_pack_entry_one(&oid, existing[k])) {
+					found = 1;
+					break;
+				}
+			}
+		}
+
+		if (found)
+			filtered_count++;
+		else
+			strbuf_add(&filtered, cur, line_len);
+
+		cur = eol + 1;
+	}
+
+	strbuf_reset(rev_list_out);
+	strbuf_addbuf(rev_list_out, &filtered);
+	strbuf_release(&filtered);
+	free(existing);
+
+	return filtered_count;
+}
+
 static int maintenance_task_stratify(struct maintenance_run_opts *opts,
 				       struct gc_config *cfg UNUSED)
 {
@@ -2082,6 +2165,32 @@ static int maintenance_task_stratify(struct maintenance_run_opts *opts,
 						obj_count, anchor_ref,
 						oid_to_hex(&tip_oid));
 			}
+		}
+
+		/*
+		 * Filter out objects that already exist in base-stratum packs
+		 * for this ref. This makes each pack truly incremental,
+		 * avoiding duplication even when ^<last_stratified> fails to
+		 * exclude all previously packed objects (e.g., after cascade
+		 * demotion resets the stratified frontier).
+		 */
+		{
+			size_t skipped = filter_already_packed_oids(&rev_list_out,
+								   anchor_ref);
+			if (skipped && !opts->quiet)
+				fprintf(stderr,
+					_("stratify: skipped %"PRIuMAX" objects already in base-stratum packs for '%s'\n"),
+					(uintmax_t)skipped, anchor_ref);
+		}
+
+		if (!rev_list_out.len) {
+			if (!opts->quiet)
+				fprintf(stderr,
+					_("stratify: all objects already packed for '%s'\n"),
+					anchor_ref);
+			strbuf_release(&rev_list_out);
+			free(last_stratified);
+			continue;
 		}
 
 		/*
