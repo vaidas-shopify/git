@@ -181,3 +181,17 @@ maintenance.stratified.grace-period::
 	threshold of `maintenance.stratified.min-age` plus this grace period.
 	If any anchor's stratifying frontier is older than this cutoff, surface-gc
 	is skipped. Defaults to `1.week.ago`.
+
+maintenance.consolidate-stratum.auto::
+	This integer config option controls how often the `consolidate-stratum`
+	task should be run as part of `git maintenance run --auto`. If zero
+	(the default), then the `consolidate-stratum` task will not run with the
+	`--auto` option. A negative value will force the task to run every time.
+	Otherwise, a positive value implies the task should run when any
+	configured anchor has at least that many base-stratum packs.
+
+maintenance.consolidate-stratum.splitfactor::
+	The geometric split factor used by the `consolidate-stratum` task when
+	deciding which of an anchor's base-stratum packs to merge, analogous to
+	the factor passed to `git repack --geometric`. Values below `2` are
+	treated as `2`. Defaults to `2`.

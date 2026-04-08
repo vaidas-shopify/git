@@ -207,6 +207,28 @@ pack by removing its `.base-stratum` file.
 The task requires at least one `maintenance.stratified.anchor` to be
 configured; it is a no-op otherwise.
 
+consolidate-stratum::
+	The `consolidate-stratum` task merges an anchor's accumulated
+	base-stratum packs into fewer, larger packs, following the same
+	geometric size progression that `git repack --geometric` uses for
+	ordinary packs. Each `stratify` run writes one base-stratum pack per
+	batch, so an active anchor steadily accumulates small packs;
+	consolidating them keeps the number of base-stratum packs bounded
+	and avoids slowing every traversal that has to load them.
++
+For each configured anchor, the task sorts that anchor's base-stratum
+packs by size, computes a geometric split, and merges the packs below
+the split into a single base-stratum pack. The merged pack records a
+single anchor commit that dominates the merged coverage; when the packs
+below the split still straddle an unstratified merge (more than one
+frontier commit remains), the group is skipped until `stratify` advances
+past the merge.
++
+Packs for anchors that are not listed in `maintenance.stratified.anchor`
+are left untouched. If no anchors are configured, the task does nothing
+and warns that existing base-stratum packs should be retired with
+`stratify-prune`.
+
 surface-gc::
 	The `surface-gc` task performs lightweight garbage collection that
 	only processes unstratified (active stratum) objects. Base-stratum packs

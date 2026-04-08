@@ -60,6 +60,29 @@ extract_sidecar_anchor () {
 	EOF
 }
 
+extract_sidecar_anchor_count () {
+	perl - "$1" <<-\EOF
+		my $path = $ARGV[0];
+		open my $fh, "<", $path or die "open $path: $!";
+		binmode $fh;
+		my $buf;
+		read $fh, $buf, -s $path;
+		print unpack("N", substr($buf, 12, 4)), "\n";
+	EOF
+}
+
+# Print the .base-stratum sidecar whose recorded anchor set CONTAINS $1.
+sidecar_for_anchor () {
+	for sc in .git/objects/pack/*.base-stratum
+	do
+		if extract_sidecar_anchor "$sc" | grep -qx "$1"
+		then
+			echo "$sc"
+			return
+		fi
+	done
+}
+
 # Overwrite the stratified_timestamp in a .base-stratum sidecar and
 # recompute its trailing checksum, so we can construct timestamps that
 # disagree with the natural commit-graph order.
@@ -410,6 +433,181 @@ test_expect_success PERL 'validate is robust to non-monotonic stratified_timesta
 		test -f "$p1_sc" &&
 		test 1 -eq $(count_sidecars) &&
 		! grep "cascade-demoting" err
+	)
+'
+
+test_expect_success PERL 'consolidate-stratum picks merged anchor by commit date' '
+	test_create_repo consolidate-by-date &&
+	(
+		cd consolidate-by-date &&
+
+		# Three sequential commits with strictly increasing
+		# committer dates, each followed by an incremental
+		# stratify run, produce three sidecars in one anchor
+		# group whose anchor_commits lie on one linear chain
+		# (c1 < c2 < c3 by committer date).
+		test_commit --no-tag --date="@1000 +0000" c1 &&
+		git config --add maintenance.stratified.anchor refs/heads/master &&
+		git maintenance run --task=stratify --quiet &&
+		p1_sc=$(ls .git/objects/pack/*.base-stratum) &&
+
+		test_commit --no-tag --date="@2000 +0000" c2 &&
+		git maintenance run --task=stratify --quiet &&
+		p2_sc=$(ls .git/objects/pack/*.base-stratum |
+			grep -v -F -- "$p1_sc") &&
+
+		test_commit --no-tag --date="@3000 +0000" c3 &&
+		git maintenance run --task=stratify --quiet &&
+		p3_sc=$(ls .git/objects/pack/*.base-stratum |
+			grep -v -F -- "$p1_sc" |
+			grep -v -F -- "$p2_sc") &&
+		test 3 -eq $(count_sidecars) &&
+
+		c3_oid=$(git rev-parse HEAD) &&
+
+		# Invert the stratified_timestamp ordering so it
+		# disagrees with the commit-graph order: P3
+		# (anchor=c3, latest commit) carries the smallest
+		# timestamp, P1 the largest. A buggy
+		# consolidate-stratum would prefer P1 as the merged
+		# anchor (largest sidecar timestamp).
+		set_sidecar_timestamp "$p3_sc" 1 &&
+		set_sidecar_timestamp "$p2_sc" 100 &&
+		set_sidecar_timestamp "$p1_sc" 200 &&
+
+		git maintenance run --task=consolidate-stratum --quiet &&
+
+		# Exactly one merged sidecar remains, and its
+		# anchor_commit is c3 — latest by committer date,
+		# not P1 (latest by stratified_timestamp).
+		test 1 -eq $(count_sidecars) &&
+		merged_sc=$(ls .git/objects/pack/*.base-stratum) &&
+		extract_sidecar_anchor "$merged_sc" >actual &&
+		echo "$c3_oid" >expect &&
+		test_cmp expect actual
+	)
+'
+
+test_expect_success 'consolidate-stratum merges packs into a multi-anchor union' '
+	test_create_repo consolidate-multi-anchor &&
+	(
+		cd consolidate-multi-anchor &&
+
+		# Old fork joined by a recent (un-stratifiable) merge, exactly
+		# as in the stranding test. With batch-size=1 the eligible fork
+		# is stratified one commit per run, producing several
+		# single-anchor packs whose anchors together form the antichain
+		# {left3, right3}.
+		test_commit --no-tag c1 &&
+		git branch right &&
+		test_commit --no-tag left1 &&
+		test_commit --no-tag left2 &&
+		test_commit --no-tag left3 &&
+		left3=$(git rev-parse HEAD) &&
+		git checkout -q right &&
+		test_commit --no-tag right1 &&
+		test_commit --no-tag right2 &&
+		test_commit --no-tag right3 &&
+		right3=$(git rev-parse HEAD) &&
+		git checkout -q master &&
+		now=$(date +%s) &&
+		recent="@$now +0000" &&
+		GIT_AUTHOR_DATE="$recent" GIT_COMMITTER_DATE="$recent" \
+			git merge --no-ff -m merge right &&
+
+		git config --add maintenance.stratified.anchor refs/heads/master &&
+
+		git config maintenance.stratified.batch-size 1 &&
+		for i in $(test_seq 1 7)
+		do
+			git maintenance run --task=stratify --quiet || return 1
+		done &&
+		git config --unset maintenance.stratified.batch-size &&
+		nsc=$(count_sidecars) &&
+		test "$nsc" -ge 2 &&
+
+		# Consolidate merges the below-split packs and records the
+		# UNION of their anchor antichains in one sidecar. The previous
+		# implementation refused this (a single recorded anchor could
+		# not represent both fork branches) and left the packs split.
+		git maintenance run --task=consolidate-stratum --quiet &&
+		test $(count_sidecars) -lt "$nsc" &&
+
+		# Coverage is preserved: both branch tips remain recorded
+		# anchors across the surviving sidecars, and at least one
+		# sidecar now records more than one anchor.
+		test -n "$(sidecar_for_anchor "$left3")" &&
+		test -n "$(sidecar_for_anchor "$right3")" &&
+		for sc in .git/objects/pack/*.base-stratum
+		do
+			extract_sidecar_anchor_count "$sc" || return 1
+		done >counts &&
+		sort -rn counts >counts_desc &&
+		test "$(head -n 1 counts_desc)" -ge 2 &&
+
+		# Stratify remains a clean no-op afterwards.
+		git maintenance run --task=stratify --no-quiet 2>err &&
+		test_grep "already fully stratified" err &&
+		! grep "skipped.*already in base-stratum" err
+	)
+'
+
+test_expect_success PERL 'standalone consolidate-stratum validates packs before merging' '
+	test_create_repo consolidate-validates &&
+	(
+		cd consolidate-validates &&
+
+		# Two stratify runs produce two base-stratum packs in the
+		# same anchor group: P1 covers c1, P2 covers c2. A rewind
+		# of master back to c1 invalidates P2 (its anchor_commit
+		# c2 is no longer an ancestor of the tip) without touching
+		# P1.
+		test_commit --no-tag c1 &&
+		c1_oid=$(git rev-parse HEAD) &&
+		git config --add maintenance.stratified.anchor refs/heads/master &&
+		git maintenance run --task=stratify --quiet &&
+		p1_sc=$(ls .git/objects/pack/*.base-stratum) &&
+
+		test_commit --no-tag c2 &&
+		git maintenance run --task=stratify --quiet &&
+		test 2 -eq $(count_sidecars) &&
+
+		git update-ref refs/heads/master "$c1_oid" &&
+
+		# Without validation, consolidate-stratum would happily
+		# merge P1 and P2 into a new pack stamped with the orphan
+		# c2 anchor_commit, silently resurrecting the rewound
+		# state under a fresh pack hash. Standalone runs must
+		# validate first and demote P2 themselves.
+		git maintenance run --task=consolidate-stratum --no-quiet 2>err &&
+		test_grep "demoting" err &&
+		test 1 -eq $(count_sidecars) &&
+		surviving_sc=$(ls .git/objects/pack/*.base-stratum) &&
+		extract_sidecar_anchor "$surviving_sc" >actual &&
+		echo "$c1_oid" >expect &&
+		test_cmp expect actual
+	)
+'
+
+test_expect_success 'standalone consolidate-stratum refuses with no configured anchors' '
+	test_create_repo consolidate-empty &&
+	(
+		cd consolidate-empty &&
+		test_commit --no-tag c1 &&
+
+		git config --add maintenance.stratified.anchor refs/heads/master &&
+		git maintenance run --task=stratify --quiet &&
+		test 1 -eq $(count_sidecars) &&
+
+		git config --unset-all maintenance.stratified.anchor &&
+
+		# With every pack an orphan, merging them all into one
+		# would re-anchor the cluster under whatever orphan ref
+		# happened to win the group sort. Refuse, same as
+		# stratify-prune.
+		git maintenance run --task=consolidate-stratum --no-quiet 2>err &&
+		test_grep "refusing to run" err &&
+		test 1 -eq $(count_sidecars)
 	)
 '
 
