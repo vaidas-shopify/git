@@ -2594,8 +2594,10 @@ static int maintenance_task_scoped_gc(struct maintenance_run_opts *opts,
 	const char *expiration = "2.weeks.ago";
 	int have_anchored = 0;
 
-	repo_config_get_string_tmp(r, "maintenance.scoped-gc.expiration",
-				   &expiration);
+	if (repo_config_get_string_tmp(r, "maintenance.scoped-gc.expiration",
+				       &expiration))
+		repo_config_get_string_tmp(r, "gc.pruneexpire",
+					   &expiration);
 
 	/*
 	 * Check if anti-cruft pinning has caught up enough for

@@ -162,6 +162,7 @@ maintenance.scoped-gc.expiration::
 	for the `scoped-gc` task. Unreachable objects in the young generation
 	older than this value are deleted. This is passed as
 	`--cruft-expiration` to linkgit:git-repack[1].
+	If unset, falls back to `gc.pruneExpire`.
 	Defaults to `2.weeks.ago`.
 
 maintenance.scoped-gc.grace-period::

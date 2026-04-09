@@ -266,7 +266,7 @@ maintenance.anti-cruft.batch-size::
 maintenance.scoped-gc.expiration::
 	Approxidate. Cruft expiration threshold for scoped-gc. Passed as
 	`--cruft-expiration` to linkgit:git-repack[1].
-	Default: `2.weeks.ago`.
+	Falls back to `gc.pruneExpire` if unset. Default: `2.weeks.ago`.
 
 maintenance.scoped-gc.grace-period::
 	Approxidate. How far behind anti-cruft pinning can lag before
