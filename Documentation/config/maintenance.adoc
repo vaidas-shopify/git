@@ -162,6 +162,7 @@ maintenance.stratified.cruft-expiration::
 	for the `surface-gc` task. Unreachable objects in the active stratum
 	older than this value are deleted. This is passed as
 	`--cruft-expiration` to linkgit:git-repack[1].
+	If unset, falls back to `gc.pruneExpire`.
 	Defaults to `2.weeks.ago`.
 
 maintenance.stratified.grace-period::

@@ -69,7 +69,7 @@ commits that might still be rewritten.
 The `.base-stratum` file uses the following binary format (version 1):
 
 ....
-Bytes 0-3:    signature (0x53545241 = "ANCH", network byte order)
+Bytes 0-3:    signature (0x53545241 = "STRA", network byte order)
 Bytes 4-7:    version (1, network byte order)
 Bytes 8-11:   hash_id (1=SHA1, 2=SHA256, network byte order)
 Next N bytes: anchor_commit OID (raw, 20 or 32 bytes)
@@ -265,7 +265,7 @@ maintenance.stratified.batch-size::
 maintenance.stratified.cruft-expiration::
 	Approxidate. Cruft expiration threshold for surface-gc. Passed as
 	`--cruft-expiration` to linkgit:git-repack[1].
-	Default: `2.weeks.ago`.
+	Falls back to `gc.pruneExpire` if unset. Default: `2.weeks.ago`.
 
 maintenance.stratified.grace-period::
 	Approxidate. How far behind stratify stratifying can lag before

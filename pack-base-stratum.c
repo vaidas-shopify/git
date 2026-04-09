@@ -29,7 +29,7 @@ static char *pack_keep_filename(struct packed_git *p)
 /*
  * .base-stratum file layout (version 1):
  *
- *   - 4 bytes: signature (0x53545241 = "ANCH", network byte order)
+ *   - 4 bytes: signature (0x53545241 = "STRA", network byte order)
  *   - 4 bytes: version (1, network byte order)
  *   - 4 bytes: hash_id (1=SHA1, 2=SHA256, network byte order)
  *   - N bytes: anchor_commit OID (raw, 20 or 32 bytes)

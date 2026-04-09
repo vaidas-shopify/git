@@ -2608,8 +2608,10 @@ static int maintenance_task_surface_gc(struct maintenance_run_opts *opts,
 	const char *expiration = "2.weeks.ago";
 	int have_base_stratum = 0;
 
-	repo_config_get_string_tmp(r, "maintenance.stratified.cruft-expiration",
-				   &expiration);
+	if (repo_config_get_string_tmp(r, "maintenance.stratified.cruft-expiration",
+				       &expiration))
+		repo_config_get_string_tmp(r, "gc.pruneexpire",
+					   &expiration);
 
 	/*
 	 * Check if stratify stratifying has caught up enough for
