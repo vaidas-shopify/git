@@ -1992,6 +1992,8 @@ static int maintenance_task_stratify(struct maintenance_run_opts *opts,
 	if (batch_size < 0)
 		batch_size = 0;
 
+	trace2_data_intmax("stratify", r, "anchors", anchors->nr);
+
 	for (i = 0; i < anchors->nr; i++) {
 		const char *anchor_ref = anchors->items[i].string;
 		struct object_id tip_oid;
@@ -2004,12 +2006,17 @@ static int maintenance_task_stratify(struct maintenance_run_opts *opts,
 		char *pack_prefix = NULL;
 		char *pack_path = NULL;
 
+		trace2_region_enter("stratify", anchor_ref, r);
+
 		/* Resolve the anchor ref */
 		if (!refs_resolve_ref_unsafe(get_main_ref_store(r),
 					     anchor_ref, RESOLVE_REF_READING,
 					     &tip_oid, NULL)) {
 			warning(_("stratify: cannot resolve anchor ref '%s'"),
 				anchor_ref);
+			trace2_data_string("stratify", r, "skipped/reason",
+					   "unresolvable-ref");
+			trace2_region_leave("stratify", anchor_ref, r);
 			continue;
 		}
 
@@ -2042,6 +2049,7 @@ static int maintenance_task_stratify(struct maintenance_run_opts *opts,
 			warning(_("stratify: failed to start rev-list for '%s'"),
 				anchor_ref);
 			free(last_stratified);
+			trace2_region_leave("stratify", anchor_ref, r);
 			continue;
 		}
 
@@ -2053,6 +2061,7 @@ static int maintenance_task_stratify(struct maintenance_run_opts *opts,
 				anchor_ref);
 			strbuf_release(&rev_list_out);
 			free(last_stratified);
+			trace2_region_leave("stratify", anchor_ref, r);
 			continue;
 		}
 
@@ -2068,8 +2077,10 @@ static int maintenance_task_stratify(struct maintenance_run_opts *opts,
 						_("stratify: no objects to stratify for '%s' (all newer than min-age)\n"),
 						anchor_ref);
 			}
+			trace2_data_intmax("stratify", r, "objects/stratified", 0);
 			strbuf_release(&rev_list_out);
 			free(last_stratified);
+			trace2_region_leave("stratify", anchor_ref, r);
 			continue;
 		}
 
@@ -2165,6 +2176,11 @@ static int maintenance_task_stratify(struct maintenance_run_opts *opts,
 						obj_count, anchor_ref,
 						oid_to_hex(&tip_oid));
 			}
+
+			trace2_data_intmax("stratify", r, "objects/stratified",
+					   obj_count);
+			trace2_data_intmax("stratify", r, "batch/truncated",
+					   truncated);
 		}
 
 		/*
@@ -2177,10 +2193,15 @@ static int maintenance_task_stratify(struct maintenance_run_opts *opts,
 		{
 			size_t skipped = filter_already_packed_oids(&rev_list_out,
 								   anchor_ref);
-			if (skipped && !opts->quiet)
-				fprintf(stderr,
-					_("stratify: skipped %"PRIuMAX" objects already in base-stratum packs for '%s'\n"),
-					(uintmax_t)skipped, anchor_ref);
+			if (skipped) {
+				trace2_data_intmax("stratify", r,
+						   "objects/already-packed",
+						   skipped);
+				if (!opts->quiet)
+					fprintf(stderr,
+						_("stratify: skipped %"PRIuMAX" objects already in base-stratum packs for '%s'\n"),
+						(uintmax_t)skipped, anchor_ref);
+			}
 		}
 
 		if (!rev_list_out.len) {
@@ -2190,6 +2211,7 @@ static int maintenance_task_stratify(struct maintenance_run_opts *opts,
 					anchor_ref);
 			strbuf_release(&rev_list_out);
 			free(last_stratified);
+			trace2_region_leave("stratify", anchor_ref, r);
 			continue;
 		}
 
@@ -2215,6 +2237,7 @@ static int maintenance_task_stratify(struct maintenance_run_opts *opts,
 				anchor_ref);
 			strbuf_release(&rev_list_out);
 			free(last_stratified);
+			trace2_region_leave("stratify", anchor_ref, r);
 			continue;
 		}
 
@@ -2232,12 +2255,14 @@ static int maintenance_task_stratify(struct maintenance_run_opts *opts,
 			strbuf_release(&pack_hash);
 			free(last_stratified);
 			result = 1;
+			trace2_region_leave("stratify", anchor_ref, r);
 			continue;
 		}
 
 		if (!pack_hash.len) {
 			strbuf_release(&pack_hash);
 			free(last_stratified);
+			trace2_region_leave("stratify", anchor_ref, r);
 			continue;
 		}
 
@@ -2264,6 +2289,7 @@ static int maintenance_task_stratify(struct maintenance_run_opts *opts,
 		free(pack_prefix);
 		strbuf_release(&pack_hash);
 		free(last_stratified);
+		trace2_region_leave("stratify", anchor_ref, r);
 	}
 
 	return result;
@@ -2302,6 +2328,8 @@ static int maintenance_task_consolidate_stratum(
 		split_factor = 2;
 
 	collect_base_stratum_pack_groups(r, &ref_groups);
+	trace2_data_intmax("consolidate-stratum", r, "groups",
+			   ref_groups.nr);
 
 	for (i = 0; i < ref_groups.nr; i++) {
 		struct base_stratum_pack_group *group = ref_groups.items[i].util;
@@ -2318,6 +2346,10 @@ static int maintenance_task_consolidate_stratum(
 		if (group->nr < 2)
 			continue;
 
+		trace2_region_enter("consolidate-stratum", anchor_ref, r);
+		trace2_data_intmax("consolidate-stratum", r, "packs/total",
+				   group->nr);
+
 		/* Build array sorted by object count (ascending) */
 		ALLOC_ARRAY(packs, group->nr);
 		for (j = 0; j < group->nr; j++)
@@ -2328,8 +2360,14 @@ static int maintenance_task_consolidate_stratum(
 						    split_factor);
 		if (split < 2) {
 			free(packs);
+			trace2_data_intmax("consolidate-stratum", r,
+					   "packs/merged", 0);
+			trace2_region_leave("consolidate-stratum",
+					    anchor_ref, r);
 			continue;
 		}
+		trace2_data_intmax("consolidate-stratum", r,
+				   "packs/merging", split);
 
 		/*
 		 * Find the latest anchor metadata among packs to merge.
@@ -2375,6 +2413,8 @@ static int maintenance_task_consolidate_stratum(
 				  "pack-objects for '%s'"), anchor_ref);
 			free(packs);
 			result = 1;
+			trace2_region_leave("consolidate-stratum",
+					    anchor_ref, r);
 			continue;
 		}
 
@@ -2410,6 +2450,8 @@ static int maintenance_task_consolidate_stratum(
 			strbuf_release(&pack_hash);
 			free(packs);
 			result = 1;
+			trace2_region_leave("consolidate-stratum",
+					    anchor_ref, r);
 			continue;
 		}
 
@@ -2436,6 +2478,8 @@ static int maintenance_task_consolidate_stratum(
 				anchor_ref);
 			free(packs);
 			result = 1;
+			trace2_region_leave("consolidate-stratum",
+					    anchor_ref, r);
 			continue;
 		}
 		write_pack_base_stratum(new_pack, &best_anchor,
@@ -2460,6 +2504,9 @@ static int maintenance_task_consolidate_stratum(
 		}
 
 		free(packs);
+		trace2_data_intmax("consolidate-stratum", r,
+				   "packs/merged", split);
+		trace2_region_leave("consolidate-stratum", anchor_ref, r);
 	}
 
 	free_base_stratum_pack_groups(&ref_groups);
@@ -2607,6 +2654,7 @@ static int maintenance_task_surface_gc(struct maintenance_run_opts *opts,
 	struct packed_git *p;
 	const char *expiration = "2.weeks.ago";
 	int have_base_stratum = 0;
+	int kept_packs = 0;
 
 	if (repo_config_get_string_tmp(r, "maintenance.stratified.cruft-expiration",
 				       &expiration))
@@ -2619,8 +2667,13 @@ static int maintenance_task_surface_gc(struct maintenance_run_opts *opts,
 	 * the active stratum is still too large and surface-gc
 	 * would be as expensive as a full repack.
 	 */
-	if (!stratify_stratifying_caught_up(r, opts->quiet))
+	if (!stratify_stratifying_caught_up(r, opts->quiet)) {
+		trace2_data_string("surface-gc", r, "skipped/reason",
+				   "stratifying-not-caught-up");
 		return 0;
+	}
+
+	trace2_data_string("surface-gc", r, "expiration", expiration);
 
 	child.git_cmd = 1;
 	strvec_pushl(&child.args, "repack", "-d", "-l", "--cruft", NULL);
@@ -2640,9 +2693,12 @@ static int maintenance_task_surface_gc(struct maintenance_run_opts *opts,
 		if (!p->in_base_stratum)
 			continue;
 		have_base_stratum = 1;
+		kept_packs++;
 		strvec_pushf(&child.args, "--keep-pack=%s",
 			     pack_basename(p));
 	}
+
+	trace2_data_intmax("surface-gc", r, "kept-packs", kept_packs);
 
 	if (have_base_stratum)
 		strvec_push(&child.args, "--kept-pack-boundary");
