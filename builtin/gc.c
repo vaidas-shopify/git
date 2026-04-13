@@ -1969,7 +1969,7 @@ static int maintenance_task_anti_cruft(struct maintenance_run_opts *opts,
 	const struct string_list *anchors = NULL;
 	const char *min_age_str = "2.weeks.ago";
 	timestamp_t min_age_ts;
-	int batch_size = 0;
+	unsigned long batch_size = 0;
 	int result = 0;
 	size_t i;
 
@@ -1987,10 +1987,8 @@ static int maintenance_task_anti_cruft(struct maintenance_run_opts *opts,
 				   &min_age_str);
 	min_age_ts = approxidate(min_age_str);
 
-	repo_config_get_int(r, "maintenance.anti-cruft.batch-size",
-			    &batch_size);
-	if (batch_size < 0)
-		batch_size = 0;
+	repo_config_get_ulong(r, "maintenance.anti-cruft.batch-size",
+			      &batch_size);
 
 	trace2_data_intmax("anti-cruft", r, "anchors", anchors->nr);
 
@@ -2108,7 +2106,7 @@ static int maintenance_task_anti_cruft(struct maintenance_run_opts *opts,
 		{
 			const char *p = rev_list_out.buf;
 			int truncated = 0;
-			int obj_count = 0;
+			unsigned long obj_count = 0;
 			int batch_exceeded = 0;
 			struct object_id batch_anchor;
 			int have_batch_anchor = 0;
@@ -2167,12 +2165,12 @@ static int maintenance_task_anti_cruft(struct maintenance_run_opts *opts,
 			if (!opts->quiet) {
 				if (truncated)
 					fprintf(stderr,
-						_("anti-cruft: pinned %d objects (batch limit) for '%s' at %s\n"),
+						_("anti-cruft: pinned %lu objects (batch limit) for '%s' at %s\n"),
 						obj_count, anchor_ref,
 						oid_to_hex(&tip_oid));
 				else
 					fprintf(stderr,
-						_("anti-cruft: pinned %d objects for '%s' at %s\n"),
+						_("anti-cruft: pinned %lu objects for '%s' at %s\n"),
 						obj_count, anchor_ref,
 						oid_to_hex(&tip_oid));
 			}

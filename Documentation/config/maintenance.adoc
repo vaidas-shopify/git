@@ -155,7 +155,8 @@ maintenance.anti-cruft.batch-size::
 	(oldest first) and records the last pinned commit so subsequent runs
 	continue where the previous batch left off. This bounds the cost of
 	the object enumeration walk and write amplification per run. A value
-	of `0` (the default) means no limit.
+	of `0` (the default) means no limit. Common unit suffixes `k`, `m`,
+	and `g` are supported.
 
 maintenance.scoped-gc.expiration::
 	An approxidate string controlling the cruft expiration threshold
