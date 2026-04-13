@@ -155,7 +155,8 @@ maintenance.stratified.batch-size::
 	(oldest first) and records the last stratified commit so subsequent runs
 	continue where the previous batch left off. This bounds the cost of
 	the object enumeration walk and write amplification per run. A value
-	of `0` (the default) means no limit.
+	of `0` (the default) means no limit. Common unit suffixes `k`, `m`,
+	and `g` are supported.
 
 maintenance.stratified.cruft-expiration::
 	An approxidate string controlling the cruft expiration threshold
