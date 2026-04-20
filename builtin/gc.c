@@ -1677,6 +1677,63 @@ out:
  * in Stratified GC).
  */
 
+/*
+ * Validate all base-stratum packs: check that each pack's anchor ref
+ * still exists and still descends from the recorded anchor commit.
+ * Demote invalid packs by removing the .base-stratum file.
+ */
+static void validate_stratify_packs(void)
+{
+	struct packed_git *p;
+	struct repository *r = the_repository;
+
+	repo_for_each_pack(r, p) {
+		struct base_stratum_data adata = { 0 };
+		struct object_id ref_oid;
+		struct child_process merge_base = CHILD_PROCESS_INIT;
+
+		if (!p->in_base_stratum)
+			continue;
+		if (load_pack_base_stratum(p, &adata)) {
+			warning(_("stratify: cannot load .base-stratum for %s, demoting"),
+				p->pack_name);
+			remove_pack_base_stratum(p);
+			continue;
+		}
+
+		/* Check if the anchor ref still exists */
+		if (!refs_resolve_ref_unsafe(get_main_ref_store(r),
+					     adata.anchor_ref,
+					     RESOLVE_REF_READING,
+					     &ref_oid, NULL)) {
+			warning(_("stratify: anchor ref '%s' no longer exists, "
+				  "demoting pack %s"),
+				adata.anchor_ref, p->pack_name);
+			remove_pack_base_stratum(p);
+			clear_base_stratum_data(&adata);
+			continue;
+		}
+
+		/*
+		 * Check if the recorded anchor commit is an ancestor of
+		 * the current ref tip. Use merge-base --is-ancestor.
+		 */
+		merge_base.git_cmd = 1;
+		strvec_pushl(&merge_base.args, "merge-base", "--is-ancestor",
+			     oid_to_hex(&adata.anchor_commit),
+			     oid_to_hex(&ref_oid), NULL);
+		if (run_command(&merge_base)) {
+			warning(_("stratify: anchor commit %s is not ancestor "
+				  "of %s tip, demoting pack %s"),
+				oid_to_hex(&adata.anchor_commit),
+				adata.anchor_ref, p->pack_name);
+			remove_pack_base_stratum(p);
+		}
+
+		clear_base_stratum_data(&adata);
+	}
+}
+
 static struct object_id *find_last_stratified_commit(const char *anchor_ref)
 {
 	struct packed_git *p;
@@ -1719,6 +1776,9 @@ static int maintenance_task_stratify(struct maintenance_run_opts *opts,
 	if (repo_config_get_string_multi(r, "maintenance.stratified.anchor",
 					 &anchors))
 		return 0; /* no anchor refs configured */
+
+	/* Validate existing base-stratum packs before stratifying new ones */
+	validate_stratify_packs();
 
 	repo_config_get_string_tmp(r, "maintenance.stratified.min-age",
 				   &min_age_str);
