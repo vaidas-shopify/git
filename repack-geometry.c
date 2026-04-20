@@ -65,6 +65,8 @@ void pack_geometry_init(struct pack_geometry *geometry,
 		}
 		if (p->is_cruft)
 			continue;
+		if (p->in_base_stratum)
+			continue;
 
 		if (p->pack_promisor) {
 			ALLOC_GROW(geometry->promisor_pack,
