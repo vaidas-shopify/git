@@ -28,6 +28,7 @@
 #include "strvec.h"
 #include "commit.h"
 #include "commit-graph.h"
+#include "pack-base-stratum.h"
 #include "packfile.h"
 #include "object-file.h"
 #include "pack.h"
@@ -263,6 +264,7 @@ enum maintenance_task_label {
 	TASK_REFLOG_EXPIRE,
 	TASK_WORKTREE_PRUNE,
 	TASK_RERERE_GC,
+	TASK_STRATIFY,
 
 	/* Leave as final value */
 	TASK__COUNT
@@ -1669,6 +1671,218 @@ out:
 	return ret;
 }
 
+/*
+ * Base-stratum maintenance task: incrementally stratify objects reachable from
+ * configured anchor refs into base-stratum packs (the "base stratum"
+ * in Stratified GC).
+ */
+
+static struct object_id *find_last_stratified_commit(const char *anchor_ref)
+{
+	struct packed_git *p;
+	struct object_id *best = NULL;
+	uint32_t best_ts = 0;
+
+	repo_for_each_pack(the_repository, p) {
+		struct base_stratum_data adata = { 0 };
+
+		if (!p->in_base_stratum)
+			continue;
+		if (load_pack_base_stratum(p, &adata))
+			continue;
+		if (!adata.anchor_ref || strcmp(adata.anchor_ref, anchor_ref)) {
+			clear_base_stratum_data(&adata);
+			continue;
+		}
+		if (adata.stratified_timestamp > best_ts) {
+			free(best);
+			best = xmalloc(sizeof(*best));
+			oidcpy(best, &adata.anchor_commit);
+			best_ts = adata.stratified_timestamp;
+		}
+		clear_base_stratum_data(&adata);
+	}
+
+	return best;
+}
+
+static int maintenance_task_stratify(struct maintenance_run_opts *opts,
+				       struct gc_config *cfg UNUSED)
+{
+	struct repository *r = the_repository;
+	const struct string_list *anchors = NULL;
+	const char *min_age_str = "2.weeks.ago";
+	timestamp_t min_age_ts;
+	int result = 0;
+	size_t i;
+
+	if (repo_config_get_string_multi(r, "maintenance.stratified.anchor",
+					 &anchors))
+		return 0; /* no anchor refs configured */
+
+	repo_config_get_string_tmp(r, "maintenance.stratified.min-age",
+				   &min_age_str);
+	min_age_ts = approxidate(min_age_str);
+
+	for (i = 0; i < anchors->nr; i++) {
+		const char *anchor_ref = anchors->items[i].string;
+		struct object_id tip_oid;
+		struct object_id *last_stratified = NULL;
+		struct child_process rev_list = CHILD_PROCESS_INIT;
+		struct child_process pack_proc = CHILD_PROCESS_INIT;
+		struct strbuf rev_list_out = STRBUF_INIT;
+		struct strbuf pack_hash = STRBUF_INIT;
+		struct packed_git *new_pack;
+		char *pack_prefix = NULL;
+		char *pack_path = NULL;
+
+		/* Resolve the anchor ref */
+		if (!refs_resolve_ref_unsafe(get_main_ref_store(r),
+					     anchor_ref, RESOLVE_REF_READING,
+					     &tip_oid, NULL)) {
+			warning(_("stratify: cannot resolve anchor ref '%s'"),
+				anchor_ref);
+			continue;
+		}
+
+		/* Find the last-stratified commit for this anchor */
+		last_stratified = find_last_stratified_commit(anchor_ref);
+
+		/*
+		 * Use rev-list to find objects reachable from the anchor
+		 * ref (up to min-age) that are not reachable from the
+		 * last-stratified commit.
+		 *
+		 * git rev-list --objects --before=<min-age> <tip> [^<last_stratified>]
+		 */
+		rev_list.git_cmd = 1;
+		strvec_pushl(&rev_list.args, "rev-list", "--objects", NULL);
+		strvec_pushf(&rev_list.args, "--before=%"PRItime, min_age_ts);
+		strvec_push(&rev_list.args, oid_to_hex(&tip_oid));
+		if (last_stratified)
+			strvec_pushf(&rev_list.args, "^%s",
+				     oid_to_hex(last_stratified));
+		/*
+		 * Do NOT pass --quiet to rev-list here: we need its
+		 * stdout output to feed pack-objects. --quiet suppresses
+		 * all output and would make the task a silent no-op.
+		 */
+
+		rev_list.out = -1;
+		if (start_command(&rev_list)) {
+			warning(_("stratify: failed to start rev-list for '%s'"),
+				anchor_ref);
+			free(last_stratified);
+			continue;
+		}
+
+		strbuf_read(&rev_list_out, rev_list.out, 0);
+		close(rev_list.out);
+
+		if (finish_command(&rev_list)) {
+			warning(_("stratify: rev-list failed for '%s'"),
+				anchor_ref);
+			strbuf_release(&rev_list_out);
+			free(last_stratified);
+			continue;
+		}
+
+		/* Nothing to stratify */
+		if (!rev_list_out.len) {
+			strbuf_release(&rev_list_out);
+			free(last_stratified);
+			continue;
+		}
+
+		/*
+		 * Pack the objects. Feed OIDs to pack-objects via stdin.
+		 * rev-list --objects outputs "oid path" lines; pack-objects
+		 * accepts this format.
+		 */
+		pack_proc.git_cmd = 1;
+		strvec_push(&pack_proc.args, "pack-objects");
+		if (opts->quiet)
+			strvec_push(&pack_proc.args, "--quiet");
+		else
+			strvec_push(&pack_proc.args, "--no-quiet");
+		strvec_pushf(&pack_proc.args, "%s/pack/base-stratum",
+			     r->objects->sources->path);
+
+		pack_proc.in = -1;
+		pack_proc.out = -1;
+
+		if (start_command(&pack_proc)) {
+			warning(_("stratify: failed to start pack-objects for '%s'"),
+				anchor_ref);
+			strbuf_release(&rev_list_out);
+			free(last_stratified);
+			continue;
+		}
+
+		write_in_full(pack_proc.in, rev_list_out.buf, rev_list_out.len);
+		close(pack_proc.in);
+		strbuf_release(&rev_list_out);
+
+		strbuf_read(&pack_hash, pack_proc.out, the_hash_algo->hexsz);
+		close(pack_proc.out);
+		strbuf_trim_trailing_newline(&pack_hash);
+
+		if (finish_command(&pack_proc)) {
+			warning(_("stratify: pack-objects failed for '%s'"),
+				anchor_ref);
+			strbuf_release(&pack_hash);
+			free(last_stratified);
+			result = 1;
+			continue;
+		}
+
+		if (!pack_hash.len) {
+			strbuf_release(&pack_hash);
+			free(last_stratified);
+			continue;
+		}
+
+		/*
+		 * Write the .base-stratum sidecar for the new pack.
+		 * pack-objects writes to <base>-<hash>.pack and outputs
+		 * <hash> on stdout. We need to find the pack to write
+		 * the sidecar.
+		 */
+		pack_prefix = xstrfmt("%s/pack/base-stratum-%s",
+				      r->objects->sources->path,
+				      pack_hash.buf);
+		pack_path = xstrfmt("%s.idx", pack_prefix);
+
+		new_pack = add_packed_git(r, pack_path, strlen(pack_path), 1);
+		if (new_pack) {
+			write_pack_base_stratum(new_pack, &tip_oid,
+					    anchor_ref,
+					    (uint32_t)time(NULL));
+			new_pack->in_base_stratum = 1;
+		}
+
+		free(pack_path);
+		free(pack_prefix);
+		strbuf_release(&pack_hash);
+		free(last_stratified);
+	}
+
+	return result;
+}
+
+static int stratify_auto_condition(struct gc_config *cfg UNUSED)
+{
+	const struct string_list *anchors = NULL;
+
+	/* Only run if anchor refs are configured */
+	if (repo_config_get_string_multi(the_repository,
+					 "maintenance.stratified.anchor",
+					 &anchors))
+		return 0;
+
+	return anchors->nr > 0;
+}
+
 typedef int (*maintenance_task_fn)(struct maintenance_run_opts *opts,
 				   struct gc_config *cfg);
 typedef int (*maintenance_auto_fn)(struct gc_config *cfg);
@@ -1746,6 +1960,11 @@ static const struct maintenance_task tasks[] = {
 		.name = "rerere-gc",
 		.background = maintenance_task_rerere_gc,
 		.auto_condition = rerere_gc_condition,
+	},
+	[TASK_STRATIFY] = {
+		.name = "stratify",
+		.background = maintenance_task_stratify,
+		.auto_condition = stratify_auto_condition,
 	},
 };
 
