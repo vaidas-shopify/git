@@ -3758,11 +3758,17 @@ static int git_pack_config(const char *k, const char *v,
 static int stdin_packs_found_nr;
 static int stdin_packs_hints_nr;
 
+struct stdin_pack_cb_data {
+	struct rev_info *revs;
+	int eager_pending;
+};
+
 static int add_object_entry_from_pack(const struct object_id *oid,
 				      struct packed_git *p,
 				      uint32_t pos,
 				      void *_data)
 {
+	struct stdin_pack_cb_data *data = _data;
 	off_t ofs;
 	struct object_info oi = OBJECT_INFO_INIT;
 	enum object_type type = OBJ_NONE;
@@ -3780,25 +3786,30 @@ static int add_object_entry_from_pack(const struct object_id *oid,
 	if (packed_object_info(p, ofs, &oi) < 0) {
 		die(_("could not get type of object %s in pack %s"),
 		    oid_to_hex(oid), p->pack_name);
-	} else if (type == OBJ_COMMIT) {
-		struct rev_info *revs = _data;
+	} else if (type == OBJ_COMMIT && data->eager_pending) {
 		/*
-		 * commits in included packs are used as starting points
-		 * for the subsequent revision walk
-		 *
-		 * Note that we do want to walk through commits that are
-		 * present in excluded-open ('!') packs to pick up any
-		 * objects reachable from them not present in the
-		 * excluded-closed ('^') packs.
-		 *
-		 * However, we'll only add those objects to the packing
-		 * list after checking `want_object_in_pack()` below.
+		 * Commits in excluded-open ('!') packs must be added as
+		 * revision walk starting points before the want check,
+		 * since want_object_in_pack() will reject them. We need
+		 * them as tips to discover objects reachable from these
+		 * packs that are not present in excluded-closed ('^')
+		 * packs.
 		 */
-		add_pending_oid(revs, NULL, oid, 0);
+		add_pending_oid(data->revs, NULL, oid, 0);
 	}
 
 	if (!want_object_in_pack(oid, 0, &p, &ofs))
 		return 0;
+
+	if (type == OBJ_COMMIT && !data->eager_pending) {
+		/*
+		 * Commits in included packs are used as starting points
+		 * for the subsequent revision walk. Only add them after
+		 * the want check to avoid walking history reachable from
+		 * commits that also exist in excluded packs.
+		 */
+		add_pending_oid(data->revs, NULL, oid, 0);
+	}
 
 	create_object_entry(oid, type, 0, 0, 0, p, ofs);
 
@@ -3945,11 +3956,17 @@ static void stdin_packs_add_pack_entries(struct strmap *packs,
 		}
 
 		if ((info->kind & STDIN_PACK_INCLUDE) ||
-		    (info->kind & STDIN_PACK_EXCLUDE_OPEN))
+		    (info->kind & STDIN_PACK_EXCLUDE_OPEN)) {
+			struct stdin_pack_cb_data data = {
+				.revs = revs,
+				.eager_pending =
+					!!(info->kind & STDIN_PACK_EXCLUDE_OPEN),
+			};
 			for_each_object_in_pack(info->p,
 						add_object_entry_from_pack,
-						revs,
+						&data,
 						ODB_FOR_EACH_OBJECT_PACK_ORDER);
+		}
 	}
 
 	string_list_clear(&keys, 0);
