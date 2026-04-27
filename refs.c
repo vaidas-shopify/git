@@ -3180,16 +3180,33 @@ static void worktree_migration_data_array_release(struct worktree_migration_data
  * worktree. The files backend needs this to locate the common git directory.
  * Returns 0 on success, -1 on failure.
  */
-static int create_commondir_file(const char *new_dir, const char *worktree_path,
-				  struct strbuf *errbuf)
+static int create_commondir_file(const char *new_dir, const char *worktree_gitdir,
+				  const char *worktree_path, struct strbuf *errbuf)
 {
 	struct strbuf commondir_path = STRBUF_INIT;
+	struct strbuf real_commondir_path = STRBUF_INIT;
 	struct strbuf commondir_content = STRBUF_INIT;
 	int fd = -1;
 	int ret = 0;
 
+	/*
+	 * The temp dir is a subdirectory of the worktree's gitdir. Read the
+	 * worktree's own commondir and adjust the path for the extra level of
+	 * nesting: prepend "../" for relative paths, or use absolute paths as-is.
+	 */
+	strbuf_addf(&real_commondir_path, "%s/commondir", worktree_gitdir);
+	if (strbuf_read_file(&commondir_content, real_commondir_path.buf, 0) < 0) {
+		strbuf_addf(errbuf, _("cannot read commondir for worktree '%s': %s"),
+			    worktree_path, strerror(errno));
+		ret = -1;
+		goto done;
+	}
+	strbuf_rtrim(&commondir_content);
+	if (!is_absolute_path(commondir_content.buf))
+		strbuf_insertstr(&commondir_content, 0, "../");
+	strbuf_addch(&commondir_content, '\n');
+
 	strbuf_addf(&commondir_path, "%s/commondir", new_dir);
-	strbuf_addstr(&commondir_content, "../..\n");
 
 	fd = open(commondir_path.buf, O_WRONLY | O_CREAT | O_EXCL, 0666);
 	if (fd < 0) {
@@ -3210,6 +3227,7 @@ done:
 	if (fd >= 0)
 		close(fd);
 	strbuf_release(&commondir_path);
+	strbuf_release(&real_commondir_path);
 	strbuf_release(&commondir_content);
 	return ret;
 }
@@ -3501,6 +3519,13 @@ static int migrate_one_reflog_entry(const char *refname,
 static int migrate_one_reflog(const char *refname, void *cb_data)
 {
 	struct migration_data *migration_data = cb_data;
+
+	if (!migration_data->is_main_worktree) {
+		enum ref_worktree_type type = parse_worktree_ref(refname, NULL, NULL, NULL);
+		if (type != REF_WORKTREE_CURRENT)
+			return 0;
+	}
+
 	return refs_for_each_reflog_ent(migration_data->old_refs, refname,
 					migrate_one_reflog_entry, migration_data);
 }
@@ -3686,6 +3711,7 @@ int repo_migrate_ref_storage_format(struct repository *repo,
 		 */
 		if (!wt_data->is_main && format == REF_STORAGE_FORMAT_FILES) {
 			if (create_commondir_file(wt_data->new_dir.buf,
+						  wt_data->old_refs->gitdir,
 						  worktrees[i]->path, errbuf) < 0) {
 				ret = -1;
 				goto done;
@@ -3779,14 +3805,27 @@ int repo_migrate_ref_storage_format(struct repository *repo,
 		 * Linked worktrees should not have a packed-refs file. If one
 		 * was created during the transaction, remove it before moving
 		 * files into place.
+		 *
+		 * Also remove the temporary commondir file we created to
+		 * bootstrap the files backend. The actual worktree gitdir
+		 * already has a correct commondir, and our temp one has a
+		 * deeper relative path that would be wrong after the move.
 		 */
 		if (!wt_data->is_main) {
-			struct strbuf packed_refs = STRBUF_INIT;
-			strbuf_addf(&packed_refs, "%s/packed-refs", wt_data->new_dir.buf);
-			if (unlink(packed_refs.buf) < 0 && errno != ENOENT)
+			struct strbuf tmp_path = STRBUF_INIT;
+
+			strbuf_addf(&tmp_path, "%s/packed-refs", wt_data->new_dir.buf);
+			if (unlink(tmp_path.buf) < 0 && errno != ENOENT)
 				warning_errno(_("could not remove packed-refs from linked worktree at '%s'"),
-					      packed_refs.buf);
-			strbuf_release(&packed_refs);
+					      tmp_path.buf);
+
+			strbuf_reset(&tmp_path);
+			strbuf_addf(&tmp_path, "%s/commondir", wt_data->new_dir.buf);
+			if (unlink(tmp_path.buf) < 0 && errno != ENOENT)
+				warning_errno(_("could not remove temporary commondir from '%s'"),
+					      tmp_path.buf);
+
+			strbuf_release(&tmp_path);
 		}
 
 		/*
