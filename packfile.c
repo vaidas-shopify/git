@@ -805,10 +805,10 @@ struct packed_git *add_packed_git(struct repository *r, const char *path,
 		return NULL;
 
 	/*
-	 * ".promisor" is long enough to hold any suffix we're adding (and
+	 * ".base-stratum" is long enough to hold any suffix we're adding (and
 	 * the use xsnprintf double-checks that)
 	 */
-	alloc = st_add3(path_len, strlen(".promisor"), 1);
+	alloc = st_add3(path_len, strlen(".base-stratum"), 1);
 	p = alloc_packed_git(r, alloc);
 	memcpy(p->pack_name, path, path_len);
 
