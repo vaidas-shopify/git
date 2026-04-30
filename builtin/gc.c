@@ -1962,21 +1962,51 @@ static size_t filter_already_packed_oids(struct strbuf *rev_list_out,
 	return filtered_count;
 }
 
+/*
+ * Populate `out` with anchor refs from "maintenance.stratified.anchor",
+ * skipping duplicates while preserving config order. Returns 0 on
+ * success, -1 if no anchors are configured.
+ *
+ * Duplicates can arise from overlapping `includeIf` rules that pull the
+ * same anchor definition into the merged config more than once. Each
+ * extra entry would re-stratify the same ref, doing redundant work and
+ * doubling trace2 output. `out` must be initialized by the caller in
+ * STRING_LIST_INIT_DUP mode and cleared afterwards.
+ */
+static int load_unique_stratify_anchors(struct repository *r,
+					struct string_list *out)
+{
+	const struct string_list *raw = NULL;
+	size_t i;
+
+	if (repo_config_get_string_multi(r, "maintenance.stratified.anchor",
+					 &raw))
+		return -1;
+
+	for (i = 0; i < raw->nr; i++) {
+		const char *anchor_ref = raw->items[i].string;
+		if (!unsorted_string_list_has_string(out, anchor_ref))
+			string_list_append(out, anchor_ref);
+	}
+
+	return 0;
+}
+
 static int maintenance_task_stratify(struct maintenance_run_opts *opts,
 				       struct gc_config *cfg UNUSED)
 {
 	struct repository *r = the_repository;
-	const struct string_list *anchors = NULL;
+	struct string_list anchors = STRING_LIST_INIT_DUP;
 	const char *min_age_str = "2.weeks.ago";
 	timestamp_t min_age_ts;
 	unsigned long batch_size = 0;
 	int result = 0;
 	size_t i;
 
-	if (repo_config_get_string_multi(r, "maintenance.stratified.anchor",
-					 &anchors)) {
+	if (load_unique_stratify_anchors(r, &anchors)) {
 		if (!opts->quiet)
 			fprintf(stderr, _("stratify: skipped, no anchor refs configured\n"));
+		string_list_clear(&anchors, 0);
 		return 0;
 	}
 
@@ -1990,10 +2020,10 @@ static int maintenance_task_stratify(struct maintenance_run_opts *opts,
 	repo_config_get_ulong(r, "maintenance.stratified.batch-size",
 			      &batch_size);
 
-	trace2_data_intmax("stratify", r, "anchors", anchors->nr);
+	trace2_data_intmax("stratify", r, "anchors", anchors.nr);
 
-	for (i = 0; i < anchors->nr; i++) {
-		const char *anchor_ref = anchors->items[i].string;
+	for (i = 0; i < anchors.nr; i++) {
+		const char *anchor_ref = anchors.items[i].string;
 		struct object_id tip_oid;
 		struct object_id *last_stratified = NULL;
 		struct child_process rev_list = CHILD_PROCESS_INIT;
@@ -2290,6 +2320,7 @@ static int maintenance_task_stratify(struct maintenance_run_opts *opts,
 		trace2_region_leave("stratify", anchor_ref, r);
 	}
 
+	string_list_clear(&anchors, 0);
 	return result;
 }
 
@@ -2553,15 +2584,17 @@ static int consolidate_stratum_auto_condition(struct gc_config *cfg UNUSED)
  */
 static int stratify_stratifying_caught_up(struct repository *r, int quiet)
 {
-	const struct string_list *anchors = NULL;
+	struct string_list anchors = STRING_LIST_INIT_DUP;
 	const char *min_age_str = "2.weeks.ago";
 	const char *grace_str = "1.week.ago";
 	timestamp_t now_ts, min_age_ts, grace_ts, cutoff_ts;
+	int ret = 1;
 	size_t i;
 
-	if (repo_config_get_string_multi(r, "maintenance.stratified.anchor",
-					 &anchors))
-		return 0;
+	if (load_unique_stratify_anchors(r, &anchors)) {
+		ret = 0;
+		goto out;
+	}
 
 	repo_config_get_string_tmp(r, "maintenance.stratified.min-age",
 				   &min_age_str);
@@ -2579,8 +2612,8 @@ static int stratify_stratifying_caught_up(struct repository *r, int quiet)
 	grace_ts = approxidate(grace_str);
 	cutoff_ts = now_ts - (now_ts - min_age_ts) - (now_ts - grace_ts);
 
-	for (i = 0; i < anchors->nr; i++) {
-		const char *anchor_ref = anchors->items[i].string;
+	for (i = 0; i < anchors.nr; i++) {
+		const char *anchor_ref = anchors.items[i].string;
 		struct packed_git *p;
 		struct object_id *best_oid = NULL;
 		uint32_t best_ts = 0;
@@ -2613,7 +2646,8 @@ static int stratify_stratifying_caught_up(struct repository *r, int quiet)
 				fprintf(stderr,
 					_("surface-gc: anchor '%s' has no stratified commits yet\n"),
 					anchor_ref);
-			return 0;
+			ret = 0;
+			goto out;
 		}
 
 		commit = lookup_commit(r, best_oid);
@@ -2624,7 +2658,8 @@ static int stratify_stratifying_caught_up(struct repository *r, int quiet)
 				fprintf(stderr,
 					_("surface-gc: cannot parse stratified commit for '%s'\n"),
 					anchor_ref);
-			return 0;
+			ret = 0;
+			goto out;
 		}
 
 		if (commit->date < cutoff_ts) {
@@ -2637,11 +2672,14 @@ static int stratify_stratifying_caught_up(struct repository *r, int quiet)
 				oid_to_hex(&commit->object.oid),
 				show_date(commit->date, 0, DATE_MODE(SHORT)),
 				min_age_str, grace_str);
-			return 0;
+			ret = 0;
+			goto out;
 		}
 	}
 
-	return 1;
+out:
+	string_list_clear(&anchors, 0);
+	return ret;
 }
 
 static int maintenance_task_surface_gc(struct maintenance_run_opts *opts,
