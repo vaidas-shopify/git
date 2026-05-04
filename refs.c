@@ -3815,15 +3815,29 @@ int repo_migrate_ref_storage_format(struct repository *repo,
 			struct strbuf tmp_path = STRBUF_INIT;
 
 			strbuf_addf(&tmp_path, "%s/packed-refs", wt_data->new_dir.buf);
-			if (unlink(tmp_path.buf) < 0 && errno != ENOENT)
-				warning_errno(_("could not remove packed-refs from linked worktree at '%s'"),
-					      tmp_path.buf);
+			if (unlink(tmp_path.buf) < 0 && errno != ENOENT) {
+				strbuf_addf(errbuf, _("could not remove packed-refs from linked worktree at '%s': %s"),
+					    tmp_path.buf, strerror(errno));
+				strbuf_release(&tmp_path);
+				ret = -1;
+				goto done;
+			}
 
+			/*
+			 * Failure here is fatal: if the temporary commondir
+			 * survives, move_files() below will rename it over the
+			 * worktree's real commondir, leaving the linked worktree
+			 * pointing at a wrong (deeper) common gitdir.
+			 */
 			strbuf_reset(&tmp_path);
 			strbuf_addf(&tmp_path, "%s/commondir", wt_data->new_dir.buf);
-			if (unlink(tmp_path.buf) < 0 && errno != ENOENT)
-				warning_errno(_("could not remove temporary commondir from '%s'"),
-					      tmp_path.buf);
+			if (unlink(tmp_path.buf) < 0 && errno != ENOENT) {
+				strbuf_addf(errbuf, _("could not remove temporary commondir from '%s': %s"),
+					    tmp_path.buf, strerror(errno));
+				strbuf_release(&tmp_path);
+				ret = -1;
+				goto done;
+			}
 
 			strbuf_release(&tmp_path);
 		}
