@@ -7,6 +7,8 @@
 #define BASE_STRATUM_VERSION 1
 
 struct packed_git;
+struct repository;
+struct strbuf;
 
 struct base_stratum_data {
 	struct object_id anchor_commit;
@@ -36,5 +38,21 @@ int write_pack_base_stratum(struct packed_git *p,
 int remove_pack_base_stratum(struct packed_git *p);
 
 void clear_base_stratum_data(struct base_stratum_data *data);
+
+/*
+ * Append the pack basename to write base-stratum packs for "anchor_ref"
+ * to "out", in the form
+ *
+ *   <objects-source>/pack/base-stratum-<anchor-digest>
+ *
+ * pack-objects appends "-<pack-hash>.pack" to produce the final pack
+ * filename. The anchor digest is a stable short hash of "anchor_ref"
+ * that gives each anchor its own filename namespace, so two anchors
+ * whose reachable object sets are identical do not collide on the same
+ * pack and overwrite each other's .base-stratum sidecar.
+ */
+void format_base_stratum_pack_basename(struct strbuf *out,
+				       struct repository *r,
+				       const char *anchor_ref);
 
 #endif

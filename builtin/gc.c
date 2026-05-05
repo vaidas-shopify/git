@@ -2247,15 +2247,27 @@ static int maintenance_task_stratify(struct maintenance_run_opts *opts,
 		 * Pack the objects. Feed OIDs to pack-objects via stdin.
 		 * rev-list --objects outputs "oid path" lines; pack-objects
 		 * accepts this format.
+		 *
+		 * The basename embeds an anchor digest so two anchors whose
+		 * reachable object sets are identical (e.g., two refs at the
+		 * same commit) get distinct pack filenames and do not
+		 * overwrite each other's .base-stratum sidecar.
 		 */
-		pack_proc.git_cmd = 1;
-		strvec_push(&pack_proc.args, "pack-objects");
-		if (opts->quiet)
-			strvec_push(&pack_proc.args, "--quiet");
-		else
-			strvec_push(&pack_proc.args, "--no-quiet");
-		strvec_pushf(&pack_proc.args, "%s/pack/base-stratum",
-			     r->objects->sources->path);
+		{
+			struct strbuf basename = STRBUF_INIT;
+			format_base_stratum_pack_basename(&basename, r,
+							  anchor_ref);
+
+			pack_proc.git_cmd = 1;
+			strvec_push(&pack_proc.args, "pack-objects");
+			if (opts->quiet)
+				strvec_push(&pack_proc.args, "--quiet");
+			else
+				strvec_push(&pack_proc.args, "--no-quiet");
+			strvec_push(&pack_proc.args, basename.buf);
+
+			pack_prefix = strbuf_detach(&basename, NULL);
+		}
 
 		pack_proc.in = -1;
 		pack_proc.out = -1;
@@ -2264,6 +2276,7 @@ static int maintenance_task_stratify(struct maintenance_run_opts *opts,
 			warning(_("stratify: failed to start pack-objects for '%s'"),
 				anchor_ref);
 			strbuf_release(&rev_list_out);
+			free(pack_prefix);
 			free(last_stratified);
 			trace2_region_leave("stratify", anchor_ref, r);
 			continue;
@@ -2281,6 +2294,7 @@ static int maintenance_task_stratify(struct maintenance_run_opts *opts,
 			warning(_("stratify: pack-objects failed for '%s'"),
 				anchor_ref);
 			strbuf_release(&pack_hash);
+			free(pack_prefix);
 			free(last_stratified);
 			result = 1;
 			trace2_region_leave("stratify", anchor_ref, r);
@@ -2289,6 +2303,7 @@ static int maintenance_task_stratify(struct maintenance_run_opts *opts,
 
 		if (!pack_hash.len) {
 			strbuf_release(&pack_hash);
+			free(pack_prefix);
 			free(last_stratified);
 			trace2_region_leave("stratify", anchor_ref, r);
 			continue;
@@ -2300,9 +2315,12 @@ static int maintenance_task_stratify(struct maintenance_run_opts *opts,
 		 * <hash> on stdout. We need to find the pack to write
 		 * the sidecar.
 		 */
-		pack_prefix = xstrfmt("%s/pack/base-stratum-%s",
-				      r->objects->sources->path,
-				      pack_hash.buf);
+		{
+			char *full_prefix = pack_prefix;
+			pack_prefix = xstrfmt("%s-%s", full_prefix,
+					      pack_hash.buf);
+			free(full_prefix);
+		}
 		pack_path = xstrfmt("%s.idx", pack_prefix);
 
 		new_pack = add_packed_git(r, pack_path, strlen(pack_path), 1);
@@ -2423,6 +2441,10 @@ static int maintenance_task_consolidate_stratum(
 		/*
 		 * Merge packs below the split using pack-objects --stdin-packs.
 		 * Positive basenames are included, ^-prefixed ones excluded.
+		 *
+		 * Use the same anchor-scoped basename as the stratify task so
+		 * two anchors whose merged pack contents collide do not
+		 * overwrite each other's pack and sidecar.
 		 */
 		pack_proc.git_cmd = 1;
 		strvec_push(&pack_proc.args, "pack-objects");
@@ -2431,8 +2453,13 @@ static int maintenance_task_consolidate_stratum(
 		else
 			strvec_push(&pack_proc.args, "--no-quiet");
 		strvec_push(&pack_proc.args, "--stdin-packs");
-		strvec_pushf(&pack_proc.args, "%s/pack/base-stratum",
-			     r->objects->sources->path);
+		{
+			struct strbuf basename = STRBUF_INIT;
+			format_base_stratum_pack_basename(&basename, r,
+							  anchor_ref);
+			strvec_push(&pack_proc.args, basename.buf);
+			pack_prefix = strbuf_detach(&basename, NULL);
+		}
 
 		pack_proc.in = -1;
 		pack_proc.out = -1;
@@ -2440,6 +2467,7 @@ static int maintenance_task_consolidate_stratum(
 		if (start_command(&pack_proc)) {
 			warning(_("consolidate-stratify: failed to start "
 				  "pack-objects for '%s'"), anchor_ref);
+			free(pack_prefix);
 			free(packs);
 			result = 1;
 			trace2_region_leave("consolidate-stratum",
@@ -2477,6 +2505,7 @@ static int maintenance_task_consolidate_stratum(
 				warning(_("consolidate-stratify: pack-objects "
 					  "failed for '%s'"), anchor_ref);
 			strbuf_release(&pack_hash);
+			free(pack_prefix);
 			free(packs);
 			result = 1;
 			trace2_region_leave("consolidate-stratum",
@@ -2485,9 +2514,12 @@ static int maintenance_task_consolidate_stratum(
 		}
 
 		/* Write .base-stratum sidecar for the new merged pack */
-		pack_prefix = xstrfmt("%s/pack/base-stratum-%s",
-				      r->objects->sources->path,
-				      pack_hash.buf);
+		{
+			char *full_prefix = pack_prefix;
+			pack_prefix = xstrfmt("%s-%s", full_prefix,
+					      pack_hash.buf);
+			free(full_prefix);
+		}
 		pack_path = xstrfmt("%s.idx", pack_prefix);
 		new_pack = add_packed_git(r, pack_path, strlen(pack_path), 1);
 		free(pack_path);

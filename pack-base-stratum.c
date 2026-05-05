@@ -242,3 +242,21 @@ void clear_base_stratum_data(struct base_stratum_data *data)
 	free(data->anchor_ref);
 	memset(data, 0, sizeof(*data));
 }
+
+void format_base_stratum_pack_basename(struct strbuf *out,
+				       struct repository *r,
+				       const char *anchor_ref)
+{
+	const struct git_hash_algo *algo = r->hash_algo;
+	struct git_hash_ctx ctx;
+	unsigned char digest[GIT_MAX_RAWSZ];
+
+	algo->init_fn(&ctx);
+	algo->update_fn(&ctx, anchor_ref, strlen(anchor_ref));
+	algo->final_fn(digest, &ctx);
+
+	strbuf_addf(out, "%s/pack/base-stratum-%02x%02x%02x%02x%02x%02x%02x%02x",
+		    r->objects->sources->path,
+		    digest[0], digest[1], digest[2], digest[3],
+		    digest[4], digest[5], digest[6], digest[7]);
+}
