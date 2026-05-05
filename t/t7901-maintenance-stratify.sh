@@ -90,4 +90,120 @@ test_expect_success 'second stratify run preserves both anchors sidecars' '
 	)
 '
 
+test_expect_success 'orphan anchor is reported but not demoted by stratify' '
+	test_create_repo orphan-warns &&
+	(
+		cd orphan-warns &&
+		test_commit --no-tag c1 &&
+		test_commit --no-tag c2 &&
+		git update-ref refs/heads/release HEAD &&
+
+		git config --add maintenance.stratified.anchor refs/heads/master &&
+		git config --add maintenance.stratified.anchor refs/heads/release &&
+		git maintenance run --task=stratify --quiet &&
+		test 2 -eq $(count_sidecars) &&
+
+		# Drop refs/heads/release from config (but not from refs).
+		git config --unset-all maintenance.stratified.anchor &&
+		git config --add maintenance.stratified.anchor refs/heads/master &&
+
+		# Stratify should warn about the orphan but leave the
+		# sidecar in place — automatic demotion would amplify a
+		# config typo. --no-quiet because maintenance defaults to
+		# quiet when stderr is not a tty.
+		git maintenance run --task=stratify --no-quiet 2>err &&
+		test_grep "no longer configured" err &&
+		test_grep "stratify-prune" err &&
+		test 2 -eq $(count_sidecars)
+	)
+'
+
+test_expect_success 'stratify-prune demotes orphan anchor packs' '
+	test_create_repo orphan-prune &&
+	(
+		cd orphan-prune &&
+		test_commit --no-tag c1 &&
+		test_commit --no-tag c2 &&
+		git update-ref refs/heads/release HEAD &&
+
+		git config --add maintenance.stratified.anchor refs/heads/master &&
+		git config --add maintenance.stratified.anchor refs/heads/release &&
+		git maintenance run --task=stratify --quiet &&
+		test 2 -eq $(count_sidecars) &&
+
+		git config --unset-all maintenance.stratified.anchor &&
+		git config --add maintenance.stratified.anchor refs/heads/master &&
+
+		# Pack count is unchanged; only the .base-stratum and .keep
+		# sidecars for the orphaned anchor go away.
+		before=$(count_packs) &&
+		git maintenance run --task=stratify-prune --quiet &&
+		after=$(count_packs) &&
+		test "$before" = "$after" &&
+		test 1 -eq $(count_sidecars) &&
+
+		# The remaining sidecar belongs to the still-configured anchor.
+		extract_sidecar_refs >actual &&
+		echo refs/heads/master >expect &&
+		test_cmp expect actual
+	)
+'
+
+test_expect_success 'stratify-prune leaves configured anchors alone' '
+	test_create_repo prune-noop &&
+	(
+		cd prune-noop &&
+		test_commit --no-tag c1 &&
+
+		git config --add maintenance.stratified.anchor refs/heads/master &&
+		git maintenance run --task=stratify --quiet &&
+		test 1 -eq $(count_sidecars) &&
+
+		git maintenance run --task=stratify-prune --quiet &&
+		test 1 -eq $(count_sidecars)
+	)
+'
+
+test_expect_success 'stratify-prune is wired into --schedule=weekly' '
+	test_create_repo prune-schedule &&
+	(
+		cd prune-schedule &&
+		test_commit --no-tag c1 &&
+
+		git config maintenance.strategy geometric &&
+		git config --add maintenance.stratified.anchor refs/heads/master &&
+
+		# Without --schedule= the task only runs when explicitly
+		# selected; with --schedule=daily it should be skipped (it
+		# is a weekly task); with --schedule=weekly it should run.
+		GIT_TRACE2_EVENT="$(pwd)/daily.txt" \
+			git maintenance run --schedule=daily --no-quiet &&
+		! grep "\"label\":\"stratify-prune\"" daily.txt &&
+
+		GIT_TRACE2_EVENT="$(pwd)/weekly.txt" \
+			git maintenance run --schedule=weekly --no-quiet &&
+		grep "\"label\":\"stratify-prune\"" weekly.txt
+	)
+'
+
+test_expect_success 'stratify-prune refuses to run with no configured anchors' '
+	test_create_repo prune-empty &&
+	(
+		cd prune-empty &&
+		test_commit --no-tag c1 &&
+
+		git config --add maintenance.stratified.anchor refs/heads/master &&
+		git maintenance run --task=stratify --quiet &&
+		test 1 -eq $(count_sidecars) &&
+
+		git config --unset-all maintenance.stratified.anchor &&
+
+		# Without anchors, every existing pack would be an orphan.
+		# The task must refuse rather than wipe state silently.
+		git maintenance run --task=stratify-prune --no-quiet 2>err &&
+		test_grep "refusing to run" err &&
+		test 1 -eq $(count_sidecars)
+	)
+'
+
 test_done

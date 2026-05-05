@@ -207,6 +207,22 @@ pack by removing its `.base-stratum` file.
 The task requires at least one `maintenance.stratified.anchor` to be
 configured; it is a no-op otherwise.
 
+stratify-prune::
+	The `stratify-prune` task demotes base-stratum packs whose anchor
+	ref is no longer listed in `maintenance.stratified.anchor`. Only
+	the `.base-stratum` and `.keep` sidecars are removed; the `.pack`
+	and `.idx` files remain on disk and become regular packs that
+	`geometric-repack` will absorb on its normal cadence.
++
+The `stratify` task warns about orphaned anchors on every run but does
+not demote them, so a typo or a temporary edit to
+`maintenance.stratified.anchor` does not blast away curated packs. The
+`stratify-prune` task is the explicit cleanup step.
++
+For safety, the task refuses to run when no anchors are configured at
+all (which would otherwise demote every base-stratum pack in the
+repository). Remove sidecars by hand if that is the intent.
+
 surface-gc::
 	The `surface-gc` task performs lightweight garbage collection that
 	only processes unstratified (active stratum) objects. Base-stratum packs

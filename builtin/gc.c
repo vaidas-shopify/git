@@ -265,6 +265,7 @@ enum maintenance_task_label {
 	TASK_WORKTREE_PRUNE,
 	TASK_RERERE_GC,
 	TASK_STRATIFY,
+	TASK_STRATIFY_PRUNE,
 	TASK_CONSOLIDATE_STRATUM,
 	TASK_SURFACE_GC,
 
@@ -1813,11 +1814,12 @@ static void free_base_stratum_pack_groups(struct string_list *ref_groups)
 	string_list_clear(ref_groups, 0);
 }
 
-static void validate_stratify_packs(void)
+static void validate_stratify_packs(struct string_list *configured,
+				    int quiet)
 {
 	struct repository *r = the_repository;
 	struct string_list ref_groups = STRING_LIST_INIT_DUP;
-	size_t i;
+	size_t i, orphan_groups = 0;
 
 	collect_base_stratum_pack_groups(r, &ref_groups);
 
@@ -1825,12 +1827,40 @@ static void validate_stratify_packs(void)
 	 * For each anchor ref group, validate packs in
 	 * stratified_timestamp order. On first failure, cascade-demote
 	 * all subsequent packs in the group.
+	 *
+	 * Additionally, surface orphan groups: anchors with base-stratum
+	 * packs on disk but no longer listed in maintenance.stratified.anchor.
+	 * These are reported via warning + trace2 but are NOT demoted here;
+	 * automatic demotion would amplify a config typo into a many-GB
+	 * re-stratification. The dedicated stratify-prune task is the
+	 * explicit way to reclaim them.
 	 */
 	for (i = 0; i < ref_groups.nr; i++) {
 		struct string_list_item *item = &ref_groups.items[i];
 		struct base_stratum_pack_group *group = item->util;
+		const char *anchor_ref = item->string;
 		size_t j;
 		int cascade = 0;
+
+		if (!unsorted_string_list_has_string(configured, anchor_ref)) {
+			orphan_groups++;
+			trace2_data_string("stratify", r, "orphan-anchor",
+					   anchor_ref);
+			if (!quiet)
+				warning(_("stratify: anchor '%s' has %"PRIuMAX
+					  " base-stratum pack(s) but is no "
+					  "longer configured; run "
+					  "'git maintenance run --task=stratify-prune' "
+					  "to reclaim"),
+					anchor_ref, (uintmax_t)group->nr);
+			/*
+			 * Skip cascade validation for orphans: their
+			 * anchor_ref may have been deleted along with the
+			 * config entry, in which case validate_single_*
+			 * would demote anyway. Pruning is the right tool.
+			 */
+			continue;
+		}
 
 		QSORT(group->entries, group->nr, cmp_base_stratum_entry_timestamp);
 
@@ -1847,6 +1877,7 @@ static void validate_stratify_packs(void)
 		}
 	}
 
+	trace2_data_intmax("stratify", r, "orphan-groups", orphan_groups);
 	free_base_stratum_pack_groups(&ref_groups);
 }
 
@@ -2011,7 +2042,7 @@ static int maintenance_task_stratify(struct maintenance_run_opts *opts,
 	}
 
 	/* Validate existing base-stratum packs before stratifying new ones */
-	validate_stratify_packs();
+	validate_stratify_packs(&anchors, opts->quiet);
 
 	repo_config_get_string_tmp(r, "maintenance.stratified.min-age",
 				   &min_age_str);
@@ -2574,6 +2605,89 @@ static int maintenance_task_consolidate_stratum(
 	return result;
 }
 
+/*
+ * Demote base-stratum packs whose anchor_ref is no longer listed in
+ * maintenance.stratified.anchor. Only the .base-stratum and .keep
+ * sidecars are removed; the .pack and .idx files remain on disk and
+ * become regular packs that geometric-repack will absorb on its
+ * normal cadence. The change is therefore reversible until the next
+ * geometric-repack run.
+ *
+ * Refuses to run when no anchors are configured at all: that would
+ * demote every base-stratum pack in the repository, which is almost
+ * certainly not what the user wants and can be done by hand if they
+ * really mean it.
+ */
+static int repo_has_base_stratum_packs(struct repository *r)
+{
+	struct packed_git *p;
+	repo_for_each_pack(r, p)
+		if (p->in_base_stratum)
+			return 1;
+	return 0;
+}
+
+static int maintenance_task_stratify_prune(struct maintenance_run_opts *opts,
+					   struct gc_config *cfg UNUSED)
+{
+	struct repository *r = the_repository;
+	struct string_list ref_groups = STRING_LIST_INIT_DUP;
+	struct string_list configured = STRING_LIST_INIT_DUP;
+	size_t i, j, demoted = 0;
+
+	if (load_unique_stratify_anchors(r, &configured)) {
+		/*
+		 * No anchors configured. If the repo has no base-stratum
+		 * packs either, this task is just a no-op for a repository
+		 * that does not use stratification — stay silent so it can
+		 * sit in the default maintenance schedule without spamming.
+		 *
+		 * If packs exist with no anchors to protect them, demoting
+		 * everything would amplify a config typo into a many-GB
+		 * re-stratification on the next run. Refuse and surface a
+		 * warning instead.
+		 */
+		if (!repo_has_base_stratum_packs(r)) {
+			string_list_clear(&configured, 0);
+			return 0;
+		}
+		warning(_("stratify-prune: refusing to run with no configured "
+			  "anchors; remove .base-stratum sidecars by hand if "
+			  "that is intended"));
+		string_list_clear(&configured, 0);
+		return 0;
+	}
+
+	collect_base_stratum_pack_groups(r, &ref_groups);
+	for (i = 0; i < ref_groups.nr; i++) {
+		struct base_stratum_pack_group *group = ref_groups.items[i].util;
+		const char *anchor = ref_groups.items[i].string;
+
+		if (unsorted_string_list_has_string(&configured, anchor))
+			continue;
+
+		trace2_region_enter("stratify-prune", anchor, r);
+		for (j = 0; j < group->nr; j++) {
+			if (!opts->quiet)
+				fprintf(stderr,
+					_("stratify-prune: demoting %s "
+					  "(anchor '%s' no longer configured)\n"),
+					pack_basename(group->entries[j].pack),
+					anchor);
+			remove_pack_base_stratum(group->entries[j].pack);
+			demoted++;
+		}
+		trace2_data_intmax("stratify-prune", r, "packs/demoted-group",
+				   group->nr);
+		trace2_region_leave("stratify-prune", anchor, r);
+	}
+	trace2_data_intmax("stratify-prune", r, "packs/demoted", demoted);
+
+	free_base_stratum_pack_groups(&ref_groups);
+	string_list_clear(&configured, 0);
+	return 0;
+}
+
 static int consolidate_stratum_auto_condition(struct gc_config *cfg UNUSED)
 {
 	struct repository *r = the_repository;
@@ -2891,6 +3005,15 @@ static const struct maintenance_task tasks[] = {
 		.background = maintenance_task_stratify,
 		.auto_condition = stratify_auto_condition,
 	},
+	[TASK_STRATIFY_PRUNE] = {
+		.name = "stratify-prune",
+		.background = maintenance_task_stratify_prune,
+		/*
+		 * No auto_condition: pruning demotes packs and is only
+		 * safe when the user has explicitly opted in by selecting
+		 * the task with --task=stratify-prune.
+		 */
+	},
 	[TASK_CONSOLIDATE_STRATUM] = {
 		.name = "consolidate-stratum",
 		.background = maintenance_task_consolidate_stratum,
@@ -3073,6 +3196,10 @@ static const struct maintenance_strategy geometric_strategy = {
 		[TASK_STRATIFY] = {
 			.type = MAINTENANCE_TYPE_SCHEDULED | MAINTENANCE_TYPE_MANUAL,
 			.schedule = SCHEDULE_DAILY,
+		},
+		[TASK_STRATIFY_PRUNE] = {
+			.type = MAINTENANCE_TYPE_SCHEDULED | MAINTENANCE_TYPE_MANUAL,
+			.schedule = SCHEDULE_WEEKLY,
 		},
 		[TASK_CONSOLIDATE_STRATUM] = {
 			.type = MAINTENANCE_TYPE_SCHEDULED | MAINTENANCE_TYPE_MANUAL,
