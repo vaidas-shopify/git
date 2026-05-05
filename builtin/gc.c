@@ -268,6 +268,7 @@ enum maintenance_task_label {
 	TASK_WORKTREE_PRUNE,
 	TASK_RERERE_GC,
 	TASK_STRATIFY,
+	TASK_STRATIFY_PRUNE,
 	TASK_CONSOLIDATE_STRATUM,
 	TASK_SURFACE_GC,
 
@@ -1748,10 +1749,29 @@ static int validate_single_base_stratum_pack(struct repository *r,
 /*
  * Collect all base-stratum packs, grouped by anchor_ref.
  * Each string_list entry's util points to an base_stratum_pack_group.
- * Packs whose .base-stratum file cannot be loaded are demoted and skipped.
+ *
+ * A pack whose .base-stratum file cannot be loaded is KEPT, not demoted,
+ * and skipped from the grouping. in_base_stratum is set from the mere
+ * existence of the sidecar (see add_packed_git()), so such a pack is
+ * still a surface-gc kept-pack boundary. Demoting it (unlinking its
+ * .keep) would expose its objects while a later, still-loadable pack of
+ * the same anchor that depends on them stays kept -- breaking the
+ * closed-set invariant exactly like a per-pack validation cascade would
+ * (see validate_stratify_packs()). We cannot recover the pack's
+ * anchor_ref to cascade its whole group (the sidecar is unreadable and
+ * the pack basename is a one-way hash of the ref), so the only
+ * closure-safe action is to leave it kept. It stays invisible to the
+ * frontier/dedup computations, which is conservative-safe; reclaiming a
+ * genuinely corrupt sidecar is a repair concern, not something this
+ * collector may do silently.
+ *
+ * When `kept_corrupt` is non-NULL it is incremented once per corrupt
+ * sidecar kept, so a caller can denounce them (warn loudly, emit trace2,
+ * exit non-zero) without the collector deciding policy.
  */
 static void collect_base_stratum_pack_groups(struct repository *r,
-					 struct string_list *ref_groups)
+					 struct string_list *ref_groups,
+					 size_t *kept_corrupt)
 {
 	struct packed_git *p;
 
@@ -1764,9 +1784,11 @@ static void collect_base_stratum_pack_groups(struct repository *r,
 		if (!p->in_base_stratum)
 			continue;
 		if (load_pack_base_stratum(p, &adata)) {
-			warning(_("stratify: cannot load .base-stratum for %s, demoting"),
+			warning(_("stratify: cannot load .base-stratum for %s, "
+				  "keeping it as a base-stratum boundary"),
 				p->pack_name);
-			remove_pack_base_stratum(p);
+			if (kept_corrupt)
+				(*kept_corrupt)++;
 			continue;
 		}
 
@@ -1819,29 +1841,52 @@ static void free_base_stratum_pack_groups(struct string_list *ref_groups)
  *
  * Each pack in an anchor's group is checked independently against the
  * current ref tip: if the pack's recorded anchor_commit is no longer an
- * ancestor of the ref, the pack is demoted. We deliberately do not rely
- * on stratified_timestamp ordering to short-circuit ("cascade") later
- * packs in the same group when an earlier one fails — that optimisation
- * silently mis-handles any timestamp source that isn't strictly monotone
- * with commit-graph order (clock rollbacks, manual sidecar edits, or any
+ * ancestor of the ref, the pack is invalid. When any pack in a group is
+ * invalid the WHOLE group is demoted, because surface-gc treats the
+ * union of an anchor's base-stratum packs as a single closed boundary
+ * and a surviving pack may depend on the invalid one (see the cascade
+ * rationale in the loop body). The cascade is keyed on validation and
+ * group membership, never on stratified_timestamp ordering, so it is
+ * unaffected by a timestamp source that isn't strictly monotone with
+ * commit-graph order (clock rollbacks, manual sidecar edits, or any
  * future code path that reuses an older timestamp on a newer pack).
+ *
+ * Returns the number of packs that should have been demoted but whose
+ * sidecar removal failed. A pack that keeps its .base-stratum is still
+ * treated as base-stratum by newer git and one that keeps its .keep
+ * stays pinned against older-git repacks, so a caller must propagate a
+ * non-zero count into its own exit status rather than report a clean
+ * validation over a still-invalid pack.
+ *
+ * Corrupt-sidecar packs are NOT counted in the return value: they are
+ * kept as safe boundaries (see collect_base_stratum_pack_groups()) and a
+ * single one must not abort all stratification. Their count is reported
+ * separately via the optional `kept_corrupt` out-param so the caller can
+ * denounce them after finishing its work.
  */
-static void validate_stratify_packs(void)
+static size_t validate_stratify_packs(struct string_list *configured,
+				    int quiet, size_t *kept_corrupt)
 {
 	struct repository *r = the_repository;
 	struct string_list ref_groups = STRING_LIST_INIT_DUP;
-	size_t i;
+	size_t i, orphan_groups = 0, demote_failed = 0;
 
-	collect_base_stratum_pack_groups(r, &ref_groups);
+	collect_base_stratum_pack_groups(r, &ref_groups, kept_corrupt);
 
 	/*
-	 * Phase 2: validate each pack in each anchor's group
-	 * independently against the current ref tip.
+	 * Phase 2: for each configured anchor ref, validate every pack
+	 * in the group independently against the current ref tip.
 	 *
-	 * Resolve the anchor ref and parse the tip commit once per group:
-	 * every pack in a group shares the same ref, and ancestry checks
-	 * can run in-process via repo_in_merge_bases() instead of forking
-	 * "git merge-base --is-ancestor" once per pack.
+	 * Resolve the anchor ref and parse the tip commit once per group
+	 * so the per-pack ancestry check can run in-process via
+	 * repo_in_merge_bases() instead of forking "git merge-base
+	 * --is-ancestor" once per pack.
+	 *
+	 * Orphan groups (anchors with packs on disk but no longer in
+	 * maintenance.stratified.anchor) are surfaced via warning +
+	 * trace2 but NOT demoted here; automatic demotion would
+	 * amplify a config typo into a many-GB re-stratification. The
+	 * stratify-prune task is the explicit way to reclaim them.
 	 */
 	for (i = 0; i < ref_groups.nr; i++) {
 		struct string_list_item *item = &ref_groups.items[i];
@@ -1849,11 +1894,33 @@ static void validate_stratify_packs(void)
 		const char *anchor_ref = item->string;
 		struct object_id ref_oid;
 		struct commit *tip_commit = NULL;
-		int ref_resolved = refs_resolve_ref_unsafe(
-				get_main_ref_store(r), anchor_ref,
-				RESOLVE_REF_READING, &ref_oid, NULL) != NULL;
+		int ref_resolved;
+		int group_bad;
 		size_t j;
 
+		if (!unsorted_string_list_has_string(configured, anchor_ref)) {
+			orphan_groups++;
+			trace2_data_string("stratify", r, "orphan-anchor",
+					   anchor_ref);
+			if (!quiet)
+				warning(_("stratify: anchor '%s' has %"PRIuMAX
+					  " base-stratum pack(s) but is no "
+					  "longer configured; run "
+					  "'git maintenance run --task=stratify-prune' "
+					  "to reclaim"),
+					anchor_ref, (uintmax_t)group->nr);
+			/*
+			 * Skip per-pack validation for orphans: their
+			 * anchor_ref may have been deleted along with the
+			 * config entry, in which case validate_single_*
+			 * would demote anyway. Pruning is the right tool.
+			 */
+			continue;
+		}
+
+		ref_resolved = refs_resolve_ref_unsafe(
+				get_main_ref_store(r), anchor_ref,
+				RESOLVE_REF_READING, &ref_oid, NULL) != NULL;
 		if (ref_resolved) {
 			/* Peel through annotated tags before lookup. */
 			tip_commit = lookup_commit_reference_gently(r,
@@ -1862,33 +1929,76 @@ static void validate_stratify_packs(void)
 				tip_commit = NULL;
 		}
 
-		for (j = 0; j < group->nr; j++) {
-			struct base_stratum_pack_entry *entry =
-				&group->entries[j];
-			int bad;
-
-			if (!ref_resolved) {
+		/*
+		 * Closure is a whole-group property, not a per-pack one.
+		 * surface-gc's --kept-pack-boundary stops the reachability
+		 * walk at any object in a kept pack, trusting that the union
+		 * of an anchor's base-stratum packs is closed under
+		 * reachability. A later pack (e.g. one holding a merge commit)
+		 * depends on earlier sibling packs of the same anchor, so
+		 * demoting only the individual pack that fails validation can
+		 * leave a dependent pack kept while the objects it relies on
+		 * are no longer in any kept pack. surface-gc would then cut
+		 * the walk at the dependent commit and expire the orphaned
+		 * side as unreachable -- a repository-integrity hole, not a
+		 * missed optimisation.
+		 *
+		 * So validate every pack independently, but if ANY pack in
+		 * the group is invalid, demote the WHOLE group. Each anchor's
+		 * packs together carry its full closure (coverage is never
+		 * shared across anchors), so dropping the group falls back to
+		 * the active stratum and the same stratify run rebuilds it
+		 * from the current tip; no dependent pack is left behind an
+		 * unsafe kept-pack boundary. The cascade is keyed on
+		 * validation plus group membership, never on
+		 * stratified_timestamp ordering, so a non-monotone timestamp
+		 * source cannot trigger it.
+		 */
+		group_bad = 0;
+		if (!ref_resolved) {
+			if (!quiet)
 				warning(_("stratify: anchor ref '%s' no longer "
-					  "exists, demoting pack %s"),
-					anchor_ref, entry->pack->pack_name);
-				bad = 1;
-			} else if (!tip_commit) {
-				warning(_("stratify: anchor ref '%s' tip "
-					  "cannot be parsed as a commit, "
-					  "demoting pack %s"),
-					anchor_ref, entry->pack->pack_name);
-				bad = 1;
-			} else {
-				bad = validate_single_base_stratum_pack(r, entry,
-									tip_commit);
+					  "exists"), anchor_ref);
+			group_bad = 1;
+		} else if (!tip_commit) {
+			if (!quiet)
+				warning(_("stratify: anchor ref '%s' tip cannot "
+					  "be parsed as a commit"), anchor_ref);
+			group_bad = 1;
+		} else {
+			for (j = 0; j < group->nr; j++) {
+				if (validate_single_base_stratum_pack(r,
+						&group->entries[j],
+						tip_commit)) {
+					group_bad = 1;
+					break;
+				}
 			}
+		}
 
-			if (bad)
-				remove_pack_base_stratum(entry->pack);
+		if (!group_bad)
+			continue;
+
+		if (!quiet)
+			warning(_("stratify: demoting all %"PRIuMAX
+				  " base-stratum pack(s) for anchor '%s' to "
+				  "preserve the closed-set invariant"),
+				(uintmax_t)group->nr, anchor_ref);
+		trace2_data_intmax("stratify", r, "group-cascade-demoted",
+				   (intmax_t)group->nr);
+
+		for (j = 0; j < group->nr; j++) {
+			if (remove_pack_base_stratum(group->entries[j].pack))
+				demote_failed++;
 		}
 	}
 
+	trace2_data_intmax("stratify", r, "orphan-groups", orphan_groups);
+	if (demote_failed)
+		trace2_data_intmax("stratify", r, "demote-failed",
+				   demote_failed);
 	free_base_stratum_pack_groups(&ref_groups);
+	return demote_failed;
 }
 
 /*
@@ -2209,7 +2319,7 @@ static int maintenance_task_stratify(struct maintenance_run_opts *opts,
 	timestamp_t min_age_ts;
 	unsigned long batch_size = 0;
 	int result = 0;
-	size_t i;
+	size_t i, kept_corrupt = 0;
 
 	if (load_unique_stratify_anchors(r, &anchors)) {
 		if (!opts->quiet)
@@ -2218,8 +2328,19 @@ static int maintenance_task_stratify(struct maintenance_run_opts *opts,
 		return 0;
 	}
 
-	/* Validate existing base-stratum packs before stratifying new ones */
-	validate_stratify_packs();
+	/*
+	 * Validate existing base-stratum packs before stratifying new ones.
+	 * A demotion that could not unlink its sidecar leaves an invalid
+	 * pack masquerading as base-stratum, so abort the task rather than
+	 * silently proceeding over it: the stale pack still satisfies
+	 * oid_in_any_pack() for its anchor, so a new stratify run would omit
+	 * objects that only exist in it and produce a pack that is no longer
+	 * closed once the invalid pack is eventually demoted.
+	 */
+	if (validate_stratify_packs(&anchors, opts->quiet, &kept_corrupt)) {
+		string_list_clear(&anchors, 0);
+		return 1;
+	}
 
 	repo_config_get_string_tmp(r, "maintenance.stratified.min-age",
 				   &min_age_str);
@@ -2799,6 +2920,21 @@ static int maintenance_task_stratify(struct maintenance_run_opts *opts,
 	}
 
 	string_list_clear(&anchors, 0);
+
+	/*
+	 * Denounce corrupt-sidecar packs kept as safe boundaries by
+	 * validation: every healthy anchor was still stratified above, but a
+	 * kept corrupt pack is an unresolved condition (its objects stay
+	 * pinned and invisible to incrementality). Emit a trace2 metric and
+	 * exit non-zero so scheduled-maintenance monitoring notices; the
+	 * non-zero status persists every run until 'stratify-prune' reclaims
+	 * the pack (when redundant) or an operator repairs it.
+	 */
+	if (kept_corrupt) {
+		trace2_data_intmax("stratify", r, "corrupt-sidecar-kept",
+				   (intmax_t)kept_corrupt);
+		result = 1;
+	}
 	return result;
 }
 
@@ -2853,24 +2989,34 @@ static int maintenance_task_consolidate_stratum(
 	 * get folded into the merged result and resurrected as a valid
 	 * base-stratum pack at the new path.
 	 *
-	 * If no anchors are configured we refuse rather than consolidate
-	 * across orphan groups: every pack in the repo would be an orphan
-	 * and merging them is almost certainly a config typo.
+	 * If no anchors are configured every pack is an orphan; merging
+	 * them would re-anchor the cluster under whichever orphan ref
+	 * happened to win the group sort. Skip and point the user at
+	 * stratify-prune, which is the explicit tool for retiring packs.
 	 */
 	if (load_unique_stratify_anchors(r, &configured)) {
 		if (repo_has_base_stratum_packs(r))
-			warning(_("consolidate-stratum: refusing to run with "
-				  "no configured anchors; run "
-				  "'git maintenance run --task=stratify-prune' "
-				  "first or remove .base-stratum sidecars by "
-				  "hand"));
+			warning(_("consolidate-stratum: skipped, no configured "
+				  "anchors; run 'git maintenance run "
+				  "--task=stratify-prune' to retire existing "
+				  "base-stratum packs"));
 		string_list_clear(&configured, 0);
 		return 0;
 	}
 
-	validate_stratify_packs();
+	/*
+	 * Abort before collecting/merging if an invalid pack could not be
+	 * demoted: merging a group that still contains a stale pack would
+	 * fold its objects into the consolidated result and resurrect them
+	 * under the merged pack's path. (ref_groups is still empty here, so
+	 * only the configured list needs freeing.)
+	 */
+	if (validate_stratify_packs(&configured, opts->quiet, NULL)) {
+		string_list_clear(&configured, 0);
+		return 1;
+	}
 
-	collect_base_stratum_pack_groups(r, &ref_groups);
+	collect_base_stratum_pack_groups(r, &ref_groups, NULL);
 	trace2_data_intmax("consolidate-stratum", r, "groups",
 			   ref_groups.nr);
 
@@ -3150,6 +3296,315 @@ static int maintenance_task_consolidate_stratum(
 	free_base_stratum_pack_groups(&ref_groups);
 	string_list_clear(&configured, 0);
 	return result;
+}
+
+/*
+ * Reclaim corrupt-sidecar packs that are provably redundant, and report
+ * (denounce) the rest. A pack whose .base-stratum will not load is kept
+ * by the collector because its anchor is unrecoverable, so it cannot be
+ * cascade-demoted with its group (see collect_base_stratum_pack_groups()).
+ * But if every object in such a pack is also present in another
+ * base-stratum pack that will REMAIN kept, demoting the corrupt copy
+ * cannot break closure: each object stays reachable through a kept pack.
+ *
+ * Holders (the packs that remain kept and may cover a corrupt pack) are
+ * the in_base_stratum packs whose sidecar loads and -- when anchors are
+ * configured -- whose anchor is configured. Orphan groups have already
+ * been demoted by the caller (their in_base_stratum flag is cleared), so
+ * a fresh scan here naturally excludes them. Redundancy is deliberately
+ * NOT checked against other corrupt packs or about-to-be-demoted orphans:
+ * coverage may only be credited to a pack we are sure stays.
+ *
+ * The redundancy test only matters while a configured anchor might still
+ * depend on the pack. When no anchors are configured the operator is
+ * winding stratification down: there is no frontier to strand, and since
+ * demotion merely unlinks sidecars (the .pack/.idx remain as a regular
+ * pack), no objects are lost. In that case every corrupt pack is demoted
+ * unconditionally so the documented retirement path completes even when
+ * the last remaining sidecar is unreadable.
+ *
+ * Returns the number of corrupt packs that could not be reclaimed and
+ * remain kept -- the caller's denounce count. *demoted_out is increased
+ * by the number reclaimed.
+ */
+static size_t reclaim_redundant_corrupt_packs(struct repository *r,
+					      struct maintenance_run_opts *opts,
+					      struct string_list *configured,
+					      int have_configured,
+					      size_t *demoted_out)
+{
+	struct packed_git **holders = NULL;
+	size_t holders_nr = 0, holders_alloc = 0;
+	struct packed_git **corrupt = NULL;
+	size_t corrupt_nr = 0, corrupt_alloc = 0;
+	struct string_list covered = STRING_LIST_INIT_DUP;
+	struct packed_git *p;
+	size_t i, reclaimed = 0, orphan_demoted = 0, kept = 0;
+	int guard_block = 0;
+
+	/* Partition base-stratum packs into holders and corrupt. */
+	repo_for_each_pack(r, p) {
+		struct base_stratum_data adata = { 0 };
+
+		if (!p->in_base_stratum)
+			continue;
+		if (load_pack_base_stratum(p, &adata)) {
+			ALLOC_GROW(corrupt, corrupt_nr + 1, corrupt_alloc);
+			corrupt[corrupt_nr++] = p;
+			continue;
+		}
+		if (have_configured &&
+		    !unsorted_string_list_has_string(configured, adata.anchor_ref)) {
+			clear_base_stratum_data(&adata);
+			continue;
+		}
+		/*
+		 * This loadable pack gives its anchor a usable frontier:
+		 * find_stratified_frontier() reads the antichain straight from
+		 * the sidecar, so it counts even if the .idx later fails to
+		 * open. Record which configured anchors still have such a pack
+		 * so the reclaim below can refuse to strand one.
+		 */
+		if (have_configured &&
+		    !unsorted_string_list_has_string(&covered, adata.anchor_ref))
+			string_list_append(&covered, adata.anchor_ref);
+		clear_base_stratum_data(&adata);
+		if (open_pack_index(p))
+			continue;
+		ALLOC_GROW(holders, holders_nr + 1, holders_alloc);
+		holders[holders_nr++] = p;
+	}
+
+	/*
+	 * A corrupt pack's anchor_ref is unrecoverable, so we cannot tell
+	 * which configured anchor it belongs to -- and in the duplicate-anchor
+	 * case its objects are byte-for-byte identical to another anchor's
+	 * pack, making attribution fundamentally impossible. Crediting its
+	 * coverage to the global holder union would let us reclaim the only
+	 * sidecar standing in for a configured anchor's frontier: closure
+	 * survives (another anchor holds the objects), but that anchor is left
+	 * with no base-stratum frontier of its own, so surface-gc skips it
+	 * with "no stratified commits yet" until a fresh stratify pass rebuilds
+	 * the pack. base-stratum coverage is anchor-scoped, and reclaim must
+	 * honor that.
+	 *
+	 * So when any configured anchor has lost every loadable pack, refuse
+	 * to reclaim corrupt packs: keep and denounce them (non-zero exit plus
+	 * the corrupt-sidecar-kept metric) so the broken anchor stays visible
+	 * and a re-stratify is prompted, rather than silently clearing the
+	 * alarm. This is deliberately conservative -- it may keep a corrupt
+	 * pack that genuinely belongs to a still-covered anchor -- but the
+	 * surplus is reclaimed on the next prune once every anchor is whole.
+	 */
+	if (have_configured) {
+		for (i = 0; i < configured->nr; i++) {
+			if (!unsorted_string_list_has_string(&covered,
+					configured->items[i].string)) {
+				guard_block = 1;
+				break;
+			}
+		}
+	}
+
+	for (i = 0; i < corrupt_nr; i++) {
+		struct packed_git *cp = corrupt[i];
+		uint32_t n;
+		int redundant = 1;
+
+		if (guard_block) {
+			/*
+			 * A configured anchor has no loadable frontier pack;
+			 * this corrupt pack might be its only stand-in, and we
+			 * cannot prove otherwise. Keep and denounce.
+			 */
+			kept++;
+			continue;
+		}
+
+		/*
+		 * Wind-down (no configured anchors): there is no anchor whose
+		 * frontier this pack could be stranding, and demotion only
+		 * unlinks the .base-stratum and .keep sidecars -- the .pack and
+		 * .idx stay on disk as a regular pack -- so no objects are lost.
+		 * Reclaim unconditionally. Without this the documented
+		 * retirement flow (unset anchors, then stratify-prune) could
+		 * never fully disable stratification when the last sidecar is
+		 * unreadable: the orphan sweep has already demoted every
+		 * loadable pack, so holders_nr == 0 and the reachability test
+		 * below would keep every non-empty corrupt pack forever.
+		 */
+		if (!have_configured) {
+			if (!opts->quiet)
+				fprintf(stderr,
+					_("stratify-prune: demoting "
+					  "corrupt-sidecar pack %s "
+					  "(no anchors configured)\n"),
+					pack_basename(cp));
+			if (remove_pack_base_stratum(cp)) {
+				/* Demotion failed: it stays kept-corrupt. */
+				kept++;
+				continue;
+			}
+			orphan_demoted++;
+			continue;
+		}
+
+		if (open_pack_index(cp)) {
+			/* Cannot enumerate objects: keep and denounce. */
+			kept++;
+			continue;
+		}
+		for (n = 0; n < cp->num_objects; n++) {
+			struct object_id oid;
+
+			if (nth_packed_object_id(&oid, cp, n) < 0 ||
+			    !oid_in_any_pack(holders, holders_nr, &oid)) {
+				redundant = 0;
+				break;
+			}
+		}
+		if (!redundant) {
+			kept++;
+			continue;
+		}
+		if (!opts->quiet)
+			fprintf(stderr,
+				_("stratify-prune: reclaiming redundant "
+				  "corrupt-sidecar pack %s\n"),
+				pack_basename(cp));
+		if (remove_pack_base_stratum(cp)) {
+			/* Demotion failed: it stays kept-corrupt. */
+			kept++;
+			continue;
+		}
+		reclaimed++;
+	}
+
+	if (reclaimed) {
+		*demoted_out += reclaimed;
+		trace2_data_intmax("stratify-prune", r,
+				   "corrupt-redundant-demoted",
+				   (intmax_t)reclaimed);
+	}
+	if (orphan_demoted) {
+		*demoted_out += orphan_demoted;
+		trace2_data_intmax("stratify-prune", r,
+				   "corrupt-orphan-demoted",
+				   (intmax_t)orphan_demoted);
+	}
+	if (kept)
+		trace2_data_intmax("stratify-prune", r, "corrupt-sidecar-kept",
+				   (intmax_t)kept);
+	if (guard_block && corrupt_nr) {
+		if (!opts->quiet)
+			fprintf(stderr,
+				_("stratify-prune: keeping corrupt-sidecar "
+				  "pack(s); a configured anchor has no readable "
+				  "base-stratum frontier (run stratify to "
+				  "rebuild it)\n"));
+		trace2_data_intmax("stratify-prune", r,
+				   "corrupt-frontier-guarded",
+				   (intmax_t)corrupt_nr);
+	}
+
+	free(holders);
+	free(corrupt);
+	string_list_clear(&covered, 0);
+	return kept;
+}
+
+/*
+ * Demote base-stratum packs whose anchor_ref is not in the configured
+ * anchor set. Only the .base-stratum and .keep sidecars are removed;
+ * the .pack and .idx files remain on disk and become regular packs
+ * that geometric-repack will absorb on its normal cadence. The change
+ * is therefore reversible until the next geometric-repack run.
+ *
+ * When no anchors are configured the configured set is empty, so every
+ * base-stratum pack is an orphan and gets demoted. This makes
+ * stratify-prune the explicit, idempotent way to wind stratification
+ * down: unset maintenance.stratified.anchor, run the task, and the
+ * next geometric repack folds the freed packs back into the active
+ * stratum.
+ *
+ * After the orphan sweep, reclaim_redundant_corrupt_packs() reclaims the
+ * corrupt-sidecar packs that are provably redundant and denounces the
+ * rest. The task exits non-zero while any corrupt sidecar remains kept.
+ */
+static int maintenance_task_stratify_prune(struct maintenance_run_opts *opts,
+					   struct gc_config *cfg UNUSED)
+{
+	struct repository *r = the_repository;
+	struct string_list ref_groups = STRING_LIST_INIT_DUP;
+	struct string_list configured = STRING_LIST_INIT_DUP;
+	int have_configured = !load_unique_stratify_anchors(r, &configured);
+	size_t i, j, demoted = 0, failed = 0, kept_corrupt = 0;
+
+	/*
+	 * Packs with a corrupt/unreadable .base-stratum are kept (not
+	 * demoted) by the collector and skipped from the grouping: their
+	 * anchor_ref is unrecoverable, so demoting one could break the
+	 * closed-set invariant for a still-loadable sibling that depends on
+	 * it (see collect_base_stratum_pack_groups()). The orphan-group loop
+	 * below cannot touch them; reclaim_redundant_corrupt_packs() then
+	 * reclaims the subset that is provably redundant and denounces the
+	 * rest (see below).
+	 */
+	collect_base_stratum_pack_groups(r, &ref_groups, NULL);
+
+	for (i = 0; i < ref_groups.nr; i++) {
+		struct base_stratum_pack_group *group = ref_groups.items[i].util;
+		const char *anchor = ref_groups.items[i].string;
+
+		if (have_configured &&
+		    unsorted_string_list_has_string(&configured, anchor))
+			continue;
+
+		trace2_region_enter("stratify-prune", anchor, r);
+		for (j = 0; j < group->nr; j++) {
+			if (!opts->quiet)
+				fprintf(stderr,
+					_("stratify-prune: demoting %s "
+					  "(anchor '%s' no longer configured)\n"),
+					pack_basename(group->entries[j].pack),
+					anchor);
+			/*
+			 * remove_pack_base_stratum() reports failure when it
+			 * cannot unlink the .base-stratum or .keep sidecar. A
+			 * pack that keeps its .base-stratum is still treated as
+			 * base-stratum by newer git; one that keeps its .keep is
+			 * pinned against older-git repacks. Either way the pack
+			 * was not demoted, so do not count it and surface the
+			 * failure rather than reporting a phantom cleanup.
+			 */
+			if (remove_pack_base_stratum(group->entries[j].pack)) {
+				failed++;
+				continue;
+			}
+			demoted++;
+		}
+		trace2_data_intmax("stratify-prune", r, "packs/processed-group",
+				   group->nr);
+		trace2_region_leave("stratify-prune", anchor, r);
+	}
+	/*
+	 * The orphan loop above only touched loadable packs. Now reclaim
+	 * corrupt-sidecar packs that are provably redundant against the
+	 * still-kept set, and denounce (count) any that remain. This runs
+	 * after the orphan loop so demoted orphans -- now in_base_stratum ==
+	 * 0 -- are excluded from the holder set.
+	 */
+	kept_corrupt = reclaim_redundant_corrupt_packs(r, opts, &configured,
+						       have_configured, &demoted);
+
+	trace2_data_intmax("stratify-prune", r, "packs/demoted", demoted);
+	if (failed)
+		trace2_data_intmax("stratify-prune", r, "packs/demote-failed",
+				   failed);
+
+	free_base_stratum_pack_groups(&ref_groups);
+	string_list_clear(&configured, 0);
+	return (failed || kept_corrupt) ? 1 : 0;
 }
 
 static int consolidate_stratum_auto_condition(struct gc_config *cfg UNUSED)
@@ -3531,6 +3986,15 @@ static const struct maintenance_task tasks[] = {
 		.background = maintenance_task_stratify,
 		.auto_condition = stratify_auto_condition,
 	},
+	[TASK_STRATIFY_PRUNE] = {
+		.name = "stratify-prune",
+		.background = maintenance_task_stratify_prune,
+		/*
+		 * No auto_condition: pruning demotes packs and is only
+		 * safe when the user has explicitly opted in by selecting
+		 * the task with --task=stratify-prune.
+		 */
+	},
 	[TASK_CONSOLIDATE_STRATUM] = {
 		.name = "consolidate-stratum",
 		.background = maintenance_task_consolidate_stratum,
@@ -3713,6 +4177,10 @@ static const struct maintenance_strategy geometric_strategy = {
 		[TASK_STRATIFY] = {
 			.type = MAINTENANCE_TYPE_SCHEDULED | MAINTENANCE_TYPE_MANUAL,
 			.schedule = SCHEDULE_DAILY,
+		},
+		[TASK_STRATIFY_PRUNE] = {
+			.type = MAINTENANCE_TYPE_SCHEDULED | MAINTENANCE_TYPE_MANUAL,
+			.schedule = SCHEDULE_WEEKLY,
 		},
 		[TASK_CONSOLIDATE_STRATUM] = {
 			.type = MAINTENANCE_TYPE_SCHEDULED | MAINTENANCE_TYPE_MANUAL,

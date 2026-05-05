@@ -83,6 +83,47 @@ sidecar_for_anchor () {
 	done
 }
 
+# Print the anchor_ref recorded in the single sidecar at $1.
+extract_sidecar_ref () {
+	perl - "$1" <<-\EOF
+		my $path = $ARGV[0];
+		open my $fh, "<", $path or die "open $path: $!";
+		binmode $fh;
+		my $buf;
+		read $fh, $buf, -s $path;
+		my $hash_id = unpack("N", substr($buf, 8, 4));
+		my $rawsz = ($hash_id == 1) ? 20 : 32;
+		my $count = unpack("N", substr($buf, 12, 4));
+		my $ref_start = 16 + $count * $rawsz + 4;
+		my $ref_end = index($buf, "\0", $ref_start);
+		print substr($buf, $ref_start, $ref_end - $ref_start);
+	EOF
+}
+
+# Print the .base-stratum sidecar whose recorded anchor_ref is $1.
+sidecar_for_ref () {
+	for sc in .git/objects/pack/*.base-stratum
+	do
+		if test "$(extract_sidecar_ref "$sc")" = "$1"
+		then
+			echo "$sc"
+			return
+		fi
+	done
+}
+
+# Configure two anchors that point at different commits, so OID-level
+# dedup does not collapse them into one pack. Used by orphan/prune tests
+# that need each anchor to have its own sidecar.
+setup_two_distinct_anchors () {
+	test_commit --no-tag c1 &&
+	git branch release HEAD &&
+	test_commit --no-tag c2 &&
+
+	git config --add maintenance.stratified.anchor refs/heads/master &&
+	git config --add maintenance.stratified.anchor refs/heads/release
+}
+
 # Overwrite the stratified_timestamp in a .base-stratum sidecar and
 # recompute its trailing checksum, so we can construct timestamps that
 # disagree with the natural commit-graph order.
@@ -421,18 +462,21 @@ test_expect_success PERL 'validate is robust to non-monotonic stratified_timesta
 		# Stratify runs validate first.
 		git maintenance run --task=stratify --no-quiet 2>err &&
 
-		# A buggy cascade would demote every pack in the group
-		# after the first invalid entry, regardless of whether
-		# those later entries are actually invalid; the per-anchor
-		# loop then re-stratifies from scratch and silently
-		# resurrects the same pack at the same path. The path /
-		# count assertions cannot tell the two regimes apart, so
-		# pin the diagnostic instead: independent validation
-		# never emits the "cascade-demoting" message.
+		# P2 (anchor c3) is invalid after the rewind. Closure is a
+		# whole-group property -- a surviving sibling can depend on a
+		# demoted one -- so validation demotes the ENTIRE anchor
+		# group, including the still-valid P1, and the same run
+		# rebuilds the stratum for master from the current tip c2.
+		# The rebuilt pack has identical contents to P1, so it reappears
+		# at the same path and the count returns to 1; the path/count
+		# assertions cannot tell that regime from "P2 demoted, P1
+		# untouched", so pin the cascade diagnostic. The cascade is
+		# driven by validation + group membership, never by the
+		# (here inverted) stratified_timestamp ordering.
+		test_grep "closed-set invariant" err &&
 		test ! -f "$p2_sc" &&
 		test -f "$p1_sc" &&
-		test 1 -eq $(count_sidecars) &&
-		! grep "cascade-demoting" err
+		test 1 -eq $(count_sidecars)
 	)
 '
 
@@ -552,6 +596,496 @@ test_expect_success 'consolidate-stratum merges packs into a multi-anchor union'
 	)
 '
 
+test_expect_success 'orphan anchor is reported but not demoted by stratify' '
+	test_create_repo orphan-warns &&
+	(
+		cd orphan-warns &&
+		test_commit --no-tag c1 &&
+		test_commit --no-tag c2 &&
+		git update-ref refs/heads/release HEAD &&
+
+		git config --add maintenance.stratified.anchor refs/heads/master &&
+		git config --add maintenance.stratified.anchor refs/heads/release &&
+		git maintenance run --task=stratify --quiet &&
+		test 2 -eq $(count_sidecars) &&
+
+		# Drop refs/heads/release from config (but not from refs).
+		git config --unset-all maintenance.stratified.anchor &&
+		git config --add maintenance.stratified.anchor refs/heads/master &&
+
+		# Stratify should warn about the orphan but leave the
+		# sidecar in place — automatic demotion would amplify a
+		# config typo. --no-quiet because maintenance defaults to
+		# quiet when stderr is not a tty.
+		git maintenance run --task=stratify --no-quiet 2>err &&
+		test_grep "no longer configured" err &&
+		test_grep "stratify-prune" err &&
+		test 2 -eq $(count_sidecars)
+	)
+'
+
+test_expect_success 'stratify-prune demotes orphan anchor packs' '
+	test_create_repo orphan-prune &&
+	(
+		cd orphan-prune &&
+		test_commit --no-tag c1 &&
+		test_commit --no-tag c2 &&
+		git update-ref refs/heads/release HEAD &&
+
+		git config --add maintenance.stratified.anchor refs/heads/master &&
+		git config --add maintenance.stratified.anchor refs/heads/release &&
+		git maintenance run --task=stratify --quiet &&
+		test 2 -eq $(count_sidecars) &&
+		before=$(count_packs) &&
+
+		git config --unset-all maintenance.stratified.anchor &&
+		git config --add maintenance.stratified.anchor refs/heads/master &&
+
+		# stratify-prune demotes the orphan pack by unlinking
+		# .base-stratum and .keep. The .pack stays on disk and is
+		# absorbed by the next geometric repack. Self-contained
+		# packs make this safe: no surviving anchor depends on
+		# the orphan pack'\''s contents.
+		git maintenance run --task=stratify-prune --no-quiet 2>err &&
+		test_grep "demoting" err &&
+		after=$(count_packs) &&
+		test "$before" = "$after" &&
+		test 1 -eq $(count_sidecars) &&
+		extract_sidecar_refs >actual &&
+		echo refs/heads/master >expect &&
+		test_cmp expect actual &&
+		test 1 -eq $(ls .git/objects/pack/*.keep 2>/dev/null | wc -l | tr -d " ")
+	)
+'
+
+test_expect_success SANITY 'stratify-prune surfaces sidecar removal failure' '
+	test_create_repo prune-fails &&
+	(
+		cd prune-fails &&
+		test_commit --no-tag c1 &&
+
+		git config --add maintenance.stratified.anchor refs/heads/master &&
+		git maintenance run --task=stratify --quiet &&
+		test 1 -eq $(count_sidecars) &&
+
+		# Orphan the only anchor so prune attempts to demote it.
+		git config --unset-all maintenance.stratified.anchor &&
+
+		# Make the pack directory non-writable so unlink() of the
+		# .base-stratum sidecar fails. The task must report failure
+		# instead of counting a phantom demotion, and the sidecar
+		# must remain so the pack is still recognised as base-stratum.
+		# Restore write permission unconditionally so trash cleanup
+		# can remove the directory even if an assertion below fails.
+		chmod a-w .git/objects/pack &&
+		{
+			test_must_fail git maintenance run \
+				--task=stratify-prune --quiet 2>err
+			status=$?
+		} &&
+		chmod u+w .git/objects/pack &&
+		test "$status" -eq 0 &&
+
+		test_grep "failed to remove" err &&
+		test_grep "task .stratify-prune. failed" err &&
+		test 1 -eq $(count_sidecars) &&
+		test 1 -eq $(ls .git/objects/pack/*.keep 2>/dev/null |
+			wc -l | tr -d " ")
+	)
+'
+
+test_expect_success 'collector keeps corrupt-sidecar packs as boundaries' '
+	test_create_repo prune-corrupt-keeps &&
+	(
+		cd prune-corrupt-keeps &&
+		test_commit --no-tag c1 &&
+
+		git config --add maintenance.stratified.anchor refs/heads/master &&
+		git maintenance run --task=stratify --quiet &&
+		test 1 -eq $(count_sidecars) &&
+		test 1 -eq $(ls .git/objects/pack/*.keep 2>/dev/null |
+			wc -l | tr -d " ") &&
+
+		# Corrupt the .base-stratum so load_pack_base_stratum() fails.
+		# in_base_stratum is set from the sidecar merely existing, so
+		# the pack is still a kept-pack boundary, but its anchor_ref is
+		# no longer recoverable. Demoting it could strand a dependent
+		# sibling, so the collector keeps it kept and warns instead of
+		# unlinking its .keep. The sidecar is 0444, so make it writable
+		# before truncating. The anchor stays configured, proving this
+		# is the collector path, not the grouped-orphan path.
+		sidecar=$(ls .git/objects/pack/*.base-stratum) &&
+		chmod u+w "$sidecar" &&
+		printf "xx" >"$sidecar" &&
+
+		# It is the only base-stratum pack, so there is no other kept
+		# pack covering its objects: it cannot be reclaimed as
+		# redundant. stratify-prune keeps it and denounces it -- warns,
+		# emits the corrupt-sidecar-kept metric, and exits non-zero.
+		test_env GIT_TRACE2_EVENT="$(pwd)/trace.txt" \
+			test_must_fail git maintenance run \
+				--task=stratify-prune --no-quiet 2>err &&
+
+		# The pack is kept: its .keep and (corrupt) .base-stratum both
+		# survive, the boundary-retention warning is emitted, and the
+		# denounce metric is logged.
+		test_grep "keeping it as a base-stratum boundary" err &&
+		grep "\"key\":\"corrupt-sidecar-kept\"" trace.txt &&
+		test 1 -eq $(count_sidecars) &&
+		test 1 -eq $(ls .git/objects/pack/*.keep 2>/dev/null |
+			wc -l | tr -d " ")
+	)
+'
+
+test_expect_success SANITY 'stratify surfaces validation demotion failure' '
+	test_create_repo stratify-validate-fails &&
+	(
+		cd stratify-validate-fails &&
+		test_commit --no-tag c1 &&
+		c1_oid=$(git rev-parse HEAD) &&
+
+		git config --add maintenance.stratified.anchor refs/heads/master &&
+		git maintenance run --task=stratify --quiet &&
+		test 1 -eq $(count_sidecars) &&
+
+		# A second commit + run stratifies an incremental pack whose
+		# anchor_commit is c2 (frontier ^c1).
+		test_commit --no-tag c2 &&
+		git maintenance run --task=stratify --quiet &&
+		test 2 -eq $(count_sidecars) &&
+
+		# Rewind master to c1 so the c2-anchored pack is no longer an
+		# ancestor of the tip: validation must demote it. Make the pack
+		# directory non-writable so the sidecar unlink fails. The task
+		# must report failure rather than exit 0 while the invalid
+		# sidecar remains. Restore write permission unconditionally for
+		# trash cleanup.
+		git reset --hard "$c1_oid" &&
+		chmod a-w .git/objects/pack &&
+		{
+			test_must_fail git maintenance run \
+				--task=stratify --quiet 2>err
+			status=$?
+		} &&
+		chmod u+w .git/objects/pack &&
+		test "$status" -eq 0 &&
+
+		test_grep "is not ancestor" err &&
+		test_grep "failed to remove" err &&
+		test_grep "task .stratify. failed" err &&
+		test 2 -eq $(count_sidecars)
+	)
+'
+
+test_expect_success 'demoted orphan retains its objects after surface-gc' '
+	test_create_repo orphan-survives-surface-gc &&
+	(
+		cd orphan-survives-surface-gc &&
+		setup_two_distinct_anchors &&
+		git maintenance run --task=stratify --quiet &&
+
+		# Record the release tip — release is about to be retired
+		# but its commit must still be reachable from the demoted
+		# pack after surface-gc.
+		release_tip=$(git rev-parse refs/heads/release) &&
+
+		git config --unset-all maintenance.stratified.anchor &&
+		git config --add maintenance.stratified.anchor refs/heads/master &&
+
+		git maintenance run --task=stratify-prune --quiet &&
+
+		# Force expiration past now so cruft would be pruned
+		# immediately if surface-gc misclassified anything.
+		git config maintenance.stratified.min-age "now" &&
+		git config maintenance.stratified.grace-period "now" &&
+		git config maintenance.stratified.cruft-expiration "now" &&
+		git maintenance run --task=surface-gc --quiet &&
+
+		# release ref is still live (only config changed); its tip
+		# commit must remain readable.
+		git cat-file -e "$release_tip" &&
+		git fsck --strict
+	)
+'
+
+test_expect_success 'corrupt-sidecar ancestor pack stays a boundary; merge side survives surface-gc' '
+	test_create_repo merge-corrupt-closure &&
+	(
+		cd merge-corrupt-closure &&
+
+		# Merge DAG: c1, sibling branches left and right1, a merge
+		# commit on master, then c3. With batch-size=1 each stratify
+		# run packs exactly one commit, so the anchor group ends up
+		# with five packs whose anchor_commits are c1, left, right1,
+		# merge and c3. The merge pack depends on the left and right1
+		# packs: left.t / right1.t are packed once, in their own
+		# packs, and excluded from the merge pack.
+		test_commit --no-tag c1 &&
+		git branch right HEAD &&
+		test_commit --no-tag left &&
+		left_oid=$(git rev-parse HEAD) &&
+		git checkout -q right &&
+		test_commit --no-tag right1 &&
+		git checkout -q master &&
+		git merge --no-ff right -m merge &&
+		test_commit --no-tag c3 &&
+
+		git config --add maintenance.stratified.anchor refs/heads/master &&
+		git config maintenance.stratified.batch-size 1 &&
+		for i in 1 2 3 4 5
+		do
+			git maintenance run --task=stratify --quiet || return 1
+		done &&
+		test 5 -eq $(count_sidecars) &&
+
+		# Corrupt the sidecar whose anchor_commit is the left commit
+		# so load_pack_base_stratum() fails. This is an ancestor pack
+		# the merge pack depends on. in_base_stratum is set from the
+		# sidecar merely existing, so the pack is still a kept-pack
+		# boundary; its anchor_ref is no longer recoverable.
+		left_sc=$(sidecar_for_anchor "$left_oid") &&
+		test -n "$left_sc" &&
+		left_keep="${left_sc%.base-stratum}.keep" &&
+		test -f "$left_keep" &&
+		chmod u+w "$left_sc" &&
+		printf "xx" >"$left_sc" &&
+
+		# A stratify run drives the collector (validate) over the
+		# group -- where demotion would happen -- and is the realistic
+		# predecessor of surface-gc in a geometric maintenance run.
+		# Demoting the corrupt pack would unlink its .keep, dropping it
+		# from the surface-gc kept-pack boundary while the dependent
+		# merge pack stayed kept and leaving the merge left side outside
+		# any kept pack. The collector must instead keep it: its .keep
+		# (and corrupt sidecar) must survive and all five packs stay
+		# kept boundaries. The kept corrupt pack is denounced, so the
+		# task exits non-zero and logs the corrupt-sidecar-kept metric,
+		# but every healthy anchor was still validated.
+		test_env GIT_TRACE2_EVENT="$(pwd)/trace.txt" \
+			test_must_fail git maintenance run \
+				--task=stratify --quiet &&
+		grep "\"key\":\"corrupt-sidecar-kept\"" trace.txt &&
+		test -f "$left_keep" &&
+		test 5 -eq $(count_sidecars) &&
+		test 5 -eq $(ls .git/objects/pack/*.keep | wc -l | tr -d " ") &&
+
+		# With the boundary intact, surface-gc keeps the merge left
+		# side and the object store stays consistent.
+		git config maintenance.stratified.min-age "now" &&
+		git config maintenance.stratified.grace-period "now" &&
+		git config maintenance.stratified.cruft-expiration "now" &&
+		git maintenance run --task=surface-gc --quiet &&
+		git cat-file -e "$left_oid:left.t" &&
+		git fsck --strict
+	)
+'
+
+test_expect_success 'stratify-prune keeps a corrupt pack that is an anchor'\''s only frontier' '
+	test_create_repo guard-corrupt-frontier &&
+	(
+		cd guard-corrupt-frontier &&
+		test_commit --no-tag c1 &&
+
+		# Two anchors at the same commit each get a self-contained,
+		# content-identical pack (cross-anchor objects are duplicated,
+		# never shared). release is listed first so surface-gc evaluates
+		# it before master, making the assertion below independent of
+		# how master'\''s own readiness is judged.
+		git update-ref refs/heads/release HEAD &&
+		git config --add maintenance.stratified.anchor refs/heads/release &&
+		git config --add maintenance.stratified.anchor refs/heads/master &&
+		git maintenance run --task=stratify --quiet &&
+		test 2 -eq $(count_sidecars) &&
+
+		# Corrupt the release anchor'\''s sidecar so load_pack_base_stratum()
+		# fails. find_stratified_frontier() skips an unreadable sidecar,
+		# so release immediately loses its frontier.
+		sidecar=$(sidecar_for_ref refs/heads/release) &&
+		test -n "$sidecar" &&
+		chmod u+w "$sidecar" &&
+		printf "xx" >"$sidecar" &&
+
+		# release'\''s objects are still covered by master'\''s pack, so a
+		# reachability-only reclaim would demote the corrupt copy --
+		# but that silently strands release with no frontier of its
+		# own. The guard refuses: it keeps and denounces the corrupt
+		# pack (non-zero exit), logs corrupt-frontier-guarded, and does
+		# NOT log corrupt-redundant-demoted.
+		test_env GIT_TRACE2_EVENT="$(pwd)/trace.txt" \
+			test_must_fail git maintenance run \
+				--task=stratify-prune --no-quiet 2>err &&
+		test_grep "no readable base-stratum frontier" err &&
+		grep "\"key\":\"corrupt-frontier-guarded\"" trace.txt &&
+		! grep "\"key\":\"corrupt-redundant-demoted\"" trace.txt &&
+		test 2 -eq $(count_sidecars) &&
+		test 2 -eq $(ls .git/objects/pack/*.keep | wc -l | tr -d " ") &&
+
+		# Readiness is anchor-scoped: surface-gc surfaces release as
+		# having no frontier rather than crediting master'\''s coverage.
+		# release comes first in config order, so the skip names it.
+		git config maintenance.stratified.min-age "now" &&
+		git config maintenance.stratified.grace-period "now" &&
+		git maintenance run --task=surface-gc --no-quiet 2>sgc_err &&
+		test_grep "anchor .refs/heads/release. has no stratified commits yet" sgc_err &&
+		git fsck --strict
+	)
+'
+
+test_expect_success 'stratify-prune reclaims a corrupt pack while its anchor keeps a loadable one' '
+	test_create_repo reclaim-surplus &&
+	(
+		cd reclaim-surplus &&
+		test_commit --no-tag c1 &&
+		git config --add maintenance.stratified.anchor refs/heads/master &&
+		git maintenance run --task=stratify --quiet &&
+		test 1 -eq $(count_sidecars) &&
+
+		# Manufacture a surplus base-stratum pack: duplicate the anchor
+		# pack (a content-identical copy) and corrupt the copy'\''s
+		# sidecar. master still has its original loadable pack, so the
+		# copy is a genuine surplus -- redundant against a pack that
+		# stays -- not the anchor'\''s only frontier. The guard stands
+		# down and the corrupt copy is reclaimable.
+		base=$(ls .git/objects/pack/*.base-stratum) &&
+		b=${base%.base-stratum} &&
+		cp "$b.pack" "$b-dup.pack" &&
+		cp "$b.idx" "$b-dup.idx" &&
+		cp "$b.base-stratum" "$b-dup.base-stratum" &&
+		cp "$b.keep" "$b-dup.keep" &&
+		chmod u+w "$b-dup.base-stratum" &&
+		printf "xx" >"$b-dup.base-stratum" &&
+		test 2 -eq $(count_sidecars) &&
+
+		# Every configured anchor keeps a loadable frontier, so prune
+		# reclaims the redundant corrupt copy (sidecar + .keep gone),
+		# logs corrupt-redundant-demoted (not corrupt-frontier-guarded),
+		# and exits zero.
+		GIT_TRACE2_EVENT="$(pwd)/trace.txt" \
+			git maintenance run --task=stratify-prune --no-quiet 2>err &&
+		test_grep "reclaiming redundant" err &&
+		grep "\"key\":\"corrupt-redundant-demoted\"" trace.txt &&
+		! grep "\"key\":\"corrupt-frontier-guarded\"" trace.txt &&
+		test 1 -eq $(count_sidecars) &&
+		test 1 -eq $(ls .git/objects/pack/*.keep | wc -l | tr -d " ") &&
+
+		# master kept its frontier, so surface-gc stays caught up and
+		# the object store is consistent.
+		git config maintenance.stratified.min-age "now" &&
+		git config maintenance.stratified.grace-period "now" &&
+		git maintenance run --task=surface-gc --no-quiet 2>sgc_err &&
+		! grep "no stratified commits yet" sgc_err &&
+		git fsck --strict
+	)
+'
+
+test_expect_success 'stratify-prune retires stratification when the last pack has a corrupt sidecar' '
+	test_create_repo wind-down-corrupt &&
+	(
+		cd wind-down-corrupt &&
+		test_commit --no-tag c1 &&
+		c1_oid=$(git rev-parse HEAD) &&
+
+		git config --add maintenance.stratified.anchor refs/heads/master &&
+		git maintenance run --task=stratify --quiet &&
+		test 1 -eq $(count_sidecars) &&
+		test 1 -eq $(ls .git/objects/pack/*.keep | wc -l | tr -d " ") &&
+
+		# Corrupt the only base-stratum sidecar so
+		# load_pack_base_stratum() fails. in_base_stratum stays set
+		# (the sidecar still exists), so the collector keeps the pack
+		# and the orphan sweep cannot touch it.
+		sidecar=$(ls .git/objects/pack/*.base-stratum) &&
+		chmod u+w "$sidecar" &&
+		printf "xx" >"$sidecar" &&
+
+		# Wind stratification down via the documented path: unset every
+		# anchor, then run stratify-prune. With no anchor to strand and
+		# demotion losing no objects (only the sidecars are unlinked),
+		# the corrupt pack must be demoted unconditionally -- not kept
+		# forever for lack of a holder. The task logs corrupt-orphan-
+		# demoted (not corrupt-sidecar-kept) and exits zero.
+		git config --unset-all maintenance.stratified.anchor &&
+		GIT_TRACE2_EVENT="$(pwd)/trace.txt" \
+			git maintenance run --task=stratify-prune --no-quiet 2>err &&
+		test_grep "no anchors configured" err &&
+		grep "\"key\":\"corrupt-orphan-demoted\"" trace.txt &&
+		! grep "\"key\":\"corrupt-sidecar-kept\"" trace.txt &&
+
+		# Both sidecars are gone: stratification is fully retired and a
+		# future run no longer treats the pack as pinned base-stratum.
+		test 0 -eq $(count_sidecars) &&
+		test 0 -eq $(ls .git/objects/pack/*.keep 2>/dev/null |
+			wc -l | tr -d " ") &&
+
+		# Demotion never deletes objects -- the .pack stays on disk.
+		git cat-file -e "$c1_oid" &&
+		git fsck --strict
+	)
+'
+
+test_expect_success 'stratify-prune leaves configured anchors alone' '
+	test_create_repo prune-noop &&
+	(
+		cd prune-noop &&
+		test_commit --no-tag c1 &&
+
+		git config --add maintenance.stratified.anchor refs/heads/master &&
+		git maintenance run --task=stratify --quiet &&
+		test 1 -eq $(count_sidecars) &&
+
+		git maintenance run --task=stratify-prune --quiet &&
+		test 1 -eq $(count_sidecars)
+	)
+'
+
+test_expect_success 'stratify-prune is wired into --schedule=weekly' '
+	test_create_repo prune-schedule &&
+	(
+		cd prune-schedule &&
+		test_commit --no-tag c1 &&
+
+		git config maintenance.strategy geometric &&
+		git config --add maintenance.stratified.anchor refs/heads/master &&
+
+		# Without --schedule= the task only runs when explicitly
+		# selected; with --schedule=daily it should be skipped (it
+		# is a weekly task); with --schedule=weekly it should run.
+		GIT_TRACE2_EVENT="$(pwd)/daily.txt" \
+			git maintenance run --schedule=daily --no-quiet &&
+		! grep "\"label\":\"stratify-prune\"" daily.txt &&
+
+		GIT_TRACE2_EVENT="$(pwd)/weekly.txt" \
+			git maintenance run --schedule=weekly --no-quiet &&
+		grep "\"label\":\"stratify-prune\"" weekly.txt
+	)
+'
+
+test_expect_success 'stratify-prune demotes all packs with no configured anchors' '
+	test_create_repo prune-empty &&
+	(
+		cd prune-empty &&
+		test_commit --no-tag c1 &&
+
+		git config --add maintenance.stratified.anchor refs/heads/master &&
+		git maintenance run --task=stratify --quiet &&
+		test 1 -eq $(count_sidecars) &&
+		before=$(count_packs) &&
+
+		git config --unset-all maintenance.stratified.anchor &&
+
+		# Unsetting maintenance.stratified.anchor empties the
+		# configured set, so every existing base-stratum pack is
+		# an orphan. stratify-prune demotes them all; the .pack
+		# files stay on disk and the next geometric repack folds
+		# them into the active stratum.
+		git maintenance run --task=stratify-prune --no-quiet 2>err &&
+		test_grep "demoting" err &&
+		test 0 -eq $(count_sidecars) &&
+		after=$(count_packs) &&
+		test "$before" = "$after"
+	)
+'
+
 test_expect_success PERL 'standalone consolidate-stratum validates packs before merging' '
 	test_create_repo consolidate-validates &&
 	(
@@ -578,18 +1112,19 @@ test_expect_success PERL 'standalone consolidate-stratum validates packs before 
 		# merge P1 and P2 into a new pack stamped with the orphan
 		# c2 anchor_commit, silently resurrecting the rewound
 		# state under a fresh pack hash. Standalone runs must
-		# validate first and demote P2 themselves.
+		# validate first. Because closure is a whole-group property,
+		# finding P2 invalid demotes the ENTIRE anchor group;
+		# consolidate-stratum does not rebuild, so no base-stratum
+		# pack remains (the objects stay on disk in the demoted packs
+		# and the next stratify run rebuilds the stratum). Either way
+		# the rewound c2 state is never resurrected under a merged pack.
 		git maintenance run --task=consolidate-stratum --no-quiet 2>err &&
-		test_grep "demoting" err &&
-		test 1 -eq $(count_sidecars) &&
-		surviving_sc=$(ls .git/objects/pack/*.base-stratum) &&
-		extract_sidecar_anchor "$surviving_sc" >actual &&
-		echo "$c1_oid" >expect &&
-		test_cmp expect actual
+		test_grep "closed-set invariant" err &&
+		test 0 -eq $(count_sidecars)
 	)
 '
 
-test_expect_success 'standalone consolidate-stratum refuses with no configured anchors' '
+test_expect_success 'standalone consolidate-stratum skips with no configured anchors and points at stratify-prune' '
 	test_create_repo consolidate-empty &&
 	(
 		cd consolidate-empty &&
@@ -603,10 +1138,11 @@ test_expect_success 'standalone consolidate-stratum refuses with no configured a
 
 		# With every pack an orphan, merging them all into one
 		# would re-anchor the cluster under whatever orphan ref
-		# happened to win the group sort. Refuse, same as
-		# stratify-prune.
+		# happened to win the group sort. consolidate-stratum
+		# skips and points at stratify-prune, which is the
+		# explicit tool for retiring orphan packs.
 		git maintenance run --task=consolidate-stratum --no-quiet 2>err &&
-		test_grep "refusing to run" err &&
+		test_grep "stratify-prune" err &&
 		test 1 -eq $(count_sidecars)
 	)
 '

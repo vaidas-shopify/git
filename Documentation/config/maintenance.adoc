@@ -139,8 +139,14 @@ maintenance.stratified.anchor::
 	base-stratum packs. Objects reachable from these refs (bounded by
 	`maintenance.stratified.min-age`) are stratified into base-stratum packs
 	that are protected from cruft expiration. Each value must be an
-	exact ref name (e.g. `refs/heads/main`). The `stratify` task is
-	a no-op if no anchors are configured. No default value.
+	exact ref name (e.g. `refs/heads/main`). No default value.
++
+The configured set is treated as the desired set of anchors: any
+existing base-stratum pack whose recorded anchor is not in the set is
+considered orphaned. When the set is empty, `stratify` is a no-op,
+`consolidate-stratum` skips (warning that existing base-stratum packs
+should be retired via `stratify-prune`), and `stratify-prune` demotes
+every base-stratum pack in the repository.
 
 maintenance.stratified.min-age::
 	An approxidate string controlling how old a commit must be before

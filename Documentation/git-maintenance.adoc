@@ -229,6 +229,25 @@ are left untouched. If no anchors are configured, the task does nothing
 and warns that existing base-stratum packs should be retired with
 `stratify-prune`.
 
+stratify-prune::
+	The `stratify-prune` task demotes base-stratum packs whose anchor
+	ref is not listed in `maintenance.stratified.anchor`. Only the
+	`.base-stratum` and `.keep` sidecars are removed; the `.pack` and
+	`.idx` files remain on disk and become regular packs that
+	`geometric-repack` will absorb on its normal cadence.
++
+The `stratify` task warns about orphaned anchors on every run but does
+not demote them, so a typo or a temporary edit to
+`maintenance.stratified.anchor` does not blast away curated packs. The
+`stratify-prune` task is the explicit cleanup step.
++
+If no anchors are configured, the configured set is empty and every
+base-stratum pack is considered an orphan, so the task demotes them
+all. This makes `stratify-prune` the explicit, idempotent way to wind
+stratification down for a repository: unset the anchor config, run the
+task, and the next geometric repack folds the freed packs back into
+the active stratum.
+
 surface-gc::
 	The `surface-gc` task performs lightweight garbage collection that
 	only processes unstratified (active stratum) objects. Base-stratum packs
