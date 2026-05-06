@@ -1699,18 +1699,6 @@ struct base_stratum_pack_group {
 	size_t alloc;
 };
 
-static int cmp_base_stratum_entry_timestamp(const void *a_, const void *b_)
-{
-	const struct base_stratum_pack_entry *a = a_;
-	const struct base_stratum_pack_entry *b = b_;
-
-	if (a->stratified_timestamp < b->stratified_timestamp)
-		return -1;
-	if (a->stratified_timestamp > b->stratified_timestamp)
-		return 1;
-	return 0;
-}
-
 /*
  * Validate a single base-stratum pack: check that the anchor ref exists
  * and that the recorded anchor commit is an ancestor of the current
@@ -1748,13 +1736,18 @@ static int validate_single_base_stratum_pack(struct repository *r,
 }
 
 /*
- * Validate all base-stratum packs with cascade demotion.
+ * Validate all base-stratum packs.
  *
- * Base-stratum packs for the same anchor ref form an incremental chain:
- * each pack is created with ^<last_stratified> exclusion, so it depends on
- * earlier packs for completeness. If a pack fails validation, all packs
- * for the same anchor ref with equal or later stratified_timestamp must also
- * be demoted to preserve the closed-set property.
+ * Each pack in an anchor's group is checked independently against the
+ * current ref tip: if the pack's recorded anchor_commit is no longer an
+ * ancestor of the ref, the pack is demoted. We deliberately do not rely
+ * on stratified_timestamp ordering to short-circuit ("cascade") later
+ * packs in the same group when an earlier one fails — that optimisation
+ * silently mis-handles any timestamp source that isn't strictly monotone
+ * with commit-graph order (clock rollbacks, manual sidecar edits, or any
+ * future code path that reuses an older timestamp on a newer pack), and
+ * for the typical group sizes consolidate-stratum maintains the per-pack
+ * cost is negligible.
  */
 /*
  * Collect all base-stratum packs, grouped by anchor_ref.
@@ -1825,15 +1818,12 @@ static void validate_stratify_packs(struct string_list *configured,
 	collect_base_stratum_pack_groups(r, &ref_groups);
 
 	/*
-	 * For each anchor ref group, validate packs in
-	 * stratified_timestamp order. On first failure, cascade-demote
-	 * all subsequent packs in the group.
-	 *
-	 * Additionally, surface orphan groups: anchors with base-stratum
-	 * packs on disk but no longer listed in maintenance.stratified.anchor.
-	 * These are reported via warning + trace2 but are NOT demoted here;
-	 * automatic demotion would amplify a config typo into a many-GB
-	 * re-stratification. The dedicated stratify-prune task is the
+	 * For each configured anchor ref, validate every pack in the
+	 * group independently. Orphan groups (anchors with packs on
+	 * disk but no longer in maintenance.stratified.anchor) are
+	 * surfaced via warning + trace2 but NOT demoted here;
+	 * automatic demotion would amplify a config typo into a
+	 * many-GB re-stratification. The stratify-prune task is the
 	 * explicit way to reclaim them.
 	 */
 	for (i = 0; i < ref_groups.nr; i++) {
@@ -1841,7 +1831,6 @@ static void validate_stratify_packs(struct string_list *configured,
 		struct base_stratum_pack_group *group = item->util;
 		const char *anchor_ref = item->string;
 		size_t j;
-		int cascade = 0;
 
 		if (!unsorted_string_list_has_string(configured, anchor_ref)) {
 			orphan_groups++;
@@ -1855,7 +1844,7 @@ static void validate_stratify_packs(struct string_list *configured,
 					  "to reclaim"),
 					anchor_ref, (uintmax_t)group->nr);
 			/*
-			 * Skip cascade validation for orphans: their
+			 * Skip per-pack validation for orphans: their
 			 * anchor_ref may have been deleted along with the
 			 * config entry, in which case validate_single_*
 			 * would demote anyway. Pruning is the right tool.
@@ -1863,18 +1852,9 @@ static void validate_stratify_packs(struct string_list *configured,
 			continue;
 		}
 
-		QSORT(group->entries, group->nr, cmp_base_stratum_entry_timestamp);
-
 		for (j = 0; j < group->nr; j++) {
-			if (cascade || validate_single_base_stratum_pack(r, &group->entries[j])) {
-				if (!cascade)
-					warning(_("stratify: cascade-demoting %"PRIuMAX" remaining "
-						  "pack(s) for ref '%s'"),
-						(uintmax_t)(group->nr - j - 1),
-						group->entries[j].anchor_ref);
-				cascade = 1;
+			if (validate_single_base_stratum_pack(r, &group->entries[j]))
 				remove_pack_base_stratum(group->entries[j].pack);
-			}
 		}
 	}
 
