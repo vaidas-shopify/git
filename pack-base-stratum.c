@@ -167,12 +167,51 @@ cleanup:
 	return ret;
 }
 
+/*
+ * Atomically (re)create "path" by writing to a unique temp sibling
+ * and renaming over. Required for both .base-stratum and .keep because
+ * we set their permissions to 0444 to discourage casual modification:
+ * once such a file exists, a plain xopen(O_WRONLY|O_TRUNC) on the
+ * same path would fail with EACCES, which collides with concurrent
+ * writers from auto-maintenance and any sequential rerun against the
+ * same deterministic pack hash. The rename is atomic and overwrites,
+ * so the last writer wins without an error.
+ *
+ * Returns -1 on failure; the caller is responsible for diagnosing.
+ */
+static int begin_atomic_write(const char *path, char **tmp_name_out)
+{
+	char *tmp_name = xstrfmt("%s.tmp-%d", path, (int)getpid());
+	int fd;
+
+	/* Best-effort: clear any leftover temp from a prior crash. */
+	unlink(tmp_name);
+
+	fd = xopen(tmp_name, O_WRONLY | O_CREAT | O_EXCL, 0444);
+	*tmp_name_out = tmp_name;
+	return fd;
+}
+
+static int finish_atomic_write(char *tmp_name, const char *final_name)
+{
+	if (rename(tmp_name, final_name)) {
+		error_errno(_("failed to rename %s to %s"),
+			    tmp_name, final_name);
+		unlink(tmp_name);
+		free(tmp_name);
+		return -1;
+	}
+	free(tmp_name);
+	return 0;
+}
+
 int write_pack_base_stratum(struct packed_git *p,
 			const struct object_id *anchor_commit,
 			const char *anchor_ref,
 			uint32_t stratified_timestamp)
 {
 	char *base_stratum_name = NULL;
+	char *tmp_name = NULL;
 	const struct git_hash_algo *algo = p->repo->hash_algo;
 	struct hashfile *f;
 	int fd;
@@ -180,8 +219,8 @@ int write_pack_base_stratum(struct packed_git *p,
 
 	base_stratum_name = pack_base_stratum_filename(p);
 
-	fd = xopen(base_stratum_name, O_WRONLY | O_CREAT | O_TRUNC, 0444);
-	f = hashfd(algo, fd, base_stratum_name);
+	fd = begin_atomic_write(base_stratum_name, &tmp_name);
+	f = hashfd(algo, fd, tmp_name);
 
 	/* header */
 	hashwrite_be32(f, BASE_STRATUM_SIGNATURE);
@@ -201,14 +240,26 @@ int write_pack_base_stratum(struct packed_git *p,
 	finalize_hashfile(f, NULL, FSYNC_COMPONENT_PACK_METADATA,
 			  CSUM_HASH_IN_STREAM | CSUM_CLOSE | CSUM_FSYNC);
 
+	if (finish_atomic_write(tmp_name, base_stratum_name)) {
+		free(base_stratum_name);
+		return -1;
+	}
+
 	/*
 	 * Write a .keep file so that older git versions (unaware of
 	 * .base-stratum) will not delete this pack during gc or repack.
+	 * Same atomic-rename dance, same race reasons.
 	 */
 	{
 		char *keep_name = pack_keep_filename(p);
-		int keep_fd = xopen(keep_name, O_WRONLY | O_CREAT | O_TRUNC, 0444);
+		char *keep_tmp = NULL;
+		int keep_fd = begin_atomic_write(keep_name, &keep_tmp);
 		close(keep_fd);
+		if (finish_atomic_write(keep_tmp, keep_name)) {
+			free(keep_name);
+			free(base_stratum_name);
+			return -1;
+		}
 		free(keep_name);
 	}
 

@@ -118,6 +118,45 @@ test_expect_success 'second stratify run with distinct anchors is a no-op' '
 	)
 '
 
+test_expect_success 'stratify rewrites read-only sidecar in place' '
+	test_create_repo rewrite-sidecar &&
+	(
+		cd rewrite-sidecar &&
+		test_commit --no-tag c1 &&
+		git config --add maintenance.stratified.anchor refs/heads/master &&
+		git maintenance run --task=stratify --quiet &&
+		test 1 -eq $(count_sidecars) &&
+
+		# write_pack_base_stratum creates .base-stratum and .keep
+		# at mode 0444. A later run that produces the same pack
+		# hash (deterministic from rev-list output) must be able to
+		# rewrite the sidecar even though it cannot be opened for
+		# writing in place.
+		#
+		# This race is real: "git commit" with the geometric
+		# maintenance strategy spawns a detached "git maintenance
+		# run --auto --detach" that runs stratify in the
+		# background, then a subsequent explicit stratify run
+		# produces the same deterministic pack hash and rewrites
+		# the same sidecar path. A non-atomic implementation fails
+		# the loser with EACCES on the existing 0444 file.
+		#
+		# Approximate the race by rerunning stratify with no new
+		# commits; the rev-list bound by ^last_stratified is empty
+		# so this is a no-op, but if last_stratified had been
+		# stale we would re-pack. Force the rewrite path by
+		# unlinking only the .base-stratum sidecar (leaving the
+		# .pack and .keep) and rerunning: stratify will re-stratify
+		# the anchor, produce the same pack hash, and need to
+		# overwrite the existing read-only .keep alongside the
+		# missing .base-stratum.
+		newest=$(ls -t .git/objects/pack/*.base-stratum | head -1) &&
+		rm -f "$newest" &&
+		git maintenance run --task=stratify --quiet &&
+		test 1 -eq $(count_sidecars)
+	)
+'
+
 test_expect_success 'orphan anchor is reported but not demoted by stratify' '
 	test_create_repo orphan-warns &&
 	(
