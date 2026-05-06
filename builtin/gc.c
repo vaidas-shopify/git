@@ -28,6 +28,8 @@
 #include "strvec.h"
 #include "commit.h"
 #include "commit-graph.h"
+#include "commit-reach.h"
+#include "odb/source-files.h"
 #include "pack-base-stratum.h"
 #include "packfile.h"
 #include "object-file.h"
@@ -1862,28 +1864,69 @@ static void validate_stratify_packs(struct string_list *configured,
 	free_base_stratum_pack_groups(&ref_groups);
 }
 
-static struct object_id *find_last_stratified_commit(const char *anchor_ref)
+/*
+ * Find the most-advanced base-stratum frontier reachable along
+ * tip_oid's history. Among all base-stratum sidecars, this returns the
+ * anchor_commit (regardless of which anchor_ref recorded it) that
+ *
+ *   - is an ancestor of tip_oid, AND
+ *   - has the latest committer date,
+ *
+ * suitable for use as a `^bound` argument to rev-list when stratifying
+ * tip_oid: everything reachable from this commit is already in some
+ * base-stratum pack, so we can skip walking it again. Returns a heap
+ * pointer the caller must free, or NULL if no anchor_commit covers any
+ * prefix of tip_oid's history.
+ *
+ * The lookup is cross-anchor on purpose: a pack written for some other
+ * anchor that happens to cover a prefix of this anchor's history is
+ * just as good as a pack of our own. The per-repo union of base-stratum
+ * packs is what carries the closed-set property; per-anchor closure was
+ * a stronger guarantee than we need.
+ */
+static struct object_id *find_stratified_ancestor(struct repository *r,
+						  const struct object_id *tip_oid)
 {
 	struct packed_git *p;
 	struct object_id *best = NULL;
-	uint32_t best_ts = 0;
+	timestamp_t best_date = 0;
+	struct commit *tip_commit;
 
-	repo_for_each_pack(the_repository, p) {
+	tip_commit = lookup_commit(r, tip_oid);
+	if (!tip_commit || repo_parse_commit(r, tip_commit))
+		return NULL;
+
+	repo_for_each_pack(r, p) {
 		struct base_stratum_data adata = { 0 };
+		struct commit *anchor_commit;
 
 		if (!p->in_base_stratum)
 			continue;
 		if (load_pack_base_stratum(p, &adata))
 			continue;
-		if (!adata.anchor_ref || strcmp(adata.anchor_ref, anchor_ref)) {
+
+		anchor_commit = lookup_commit(r, &adata.anchor_commit);
+		if (!anchor_commit || repo_parse_commit(r, anchor_commit)) {
 			clear_base_stratum_data(&adata);
 			continue;
 		}
-		if (adata.stratified_timestamp > best_ts) {
+
+		/*
+		 * Only consider anchors that lie on tip_oid's first-parent
+		 * ancestry — using a non-ancestor as ^bound would over-
+		 * exclude (descendants of tip_oid drag too much along)
+		 * or have no effect (unrelated commits).
+		 */
+		if (!repo_in_merge_bases(r, anchor_commit, tip_commit)) {
+			clear_base_stratum_data(&adata);
+			continue;
+		}
+
+		if (anchor_commit->date > best_date) {
 			free(best);
 			best = xmalloc(sizeof(*best));
 			oidcpy(best, &adata.anchor_commit);
-			best_ts = adata.stratified_timestamp;
+			best_date = anchor_commit->date;
 		}
 		clear_base_stratum_data(&adata);
 	}
@@ -1892,15 +1935,90 @@ static struct object_id *find_last_stratified_commit(const char *anchor_ref)
 }
 
 /*
- * Filter OIDs from rev_list_out that already exist in base-stratum packs
- * for the given anchor_ref. This prevents creating packs with objects
- * that are already in prior base-stratum packs, making each pack truly
- * incremental.
+ * Compute how recently tip_oid's history has been stratified, looking
+ * across all configured anchors' packs.
+ *
+ * Unlike find_stratified_ancestor() (which only accepts strict
+ * ancestors so it can be safely used as a rev-list `^bound`), this
+ * helper also accepts a pack whose anchor_commit is a *descendant* of
+ * tip_oid: such a pack's coverage strictly contains all of tip_oid's
+ * reachables, so it counts as full coverage and the frontier on this
+ * anchor's history is at tip_oid itself.
+ *
+ *   - For each pack with anchor_commit C ancestor of tip_oid, the
+ *     candidate frontier date is C's committer date.
+ *   - For each pack with anchor_commit C descendant of tip_oid, the
+ *     candidate frontier date is tip_oid's own committer date
+ *     (clamped — coverage extends past tip_oid but the anchor's own
+ *     history ends there).
+ *   - Packs unrelated to tip_oid contribute nothing.
+ *
+ * Returns the maximum candidate date, or 0 if no pack covers any
+ * portion of tip_oid's history.
+ */
+static timestamp_t stratified_frontier_date(struct repository *r,
+					    const struct object_id *tip_oid)
+{
+	struct packed_git *p;
+	timestamp_t best = 0;
+	struct commit *tip_commit;
+
+	tip_commit = lookup_commit(r, tip_oid);
+	if (!tip_commit || repo_parse_commit(r, tip_commit))
+		return 0;
+
+	repo_for_each_pack(r, p) {
+		struct base_stratum_data adata = { 0 };
+		struct commit *anchor_commit;
+		timestamp_t cand;
+
+		if (!p->in_base_stratum)
+			continue;
+		if (load_pack_base_stratum(p, &adata))
+			continue;
+
+		anchor_commit = lookup_commit(r, &adata.anchor_commit);
+		if (!anchor_commit || repo_parse_commit(r, anchor_commit)) {
+			clear_base_stratum_data(&adata);
+			continue;
+		}
+
+		if (repo_in_merge_bases(r, anchor_commit, tip_commit)) {
+			/* anchor_commit is ancestor of tip_oid */
+			cand = anchor_commit->date;
+		} else if (repo_in_merge_bases(r, tip_commit, anchor_commit)) {
+			/* anchor_commit is descendant: full coverage of tip */
+			cand = tip_commit->date;
+		} else {
+			/* unrelated histories */
+			clear_base_stratum_data(&adata);
+			continue;
+		}
+
+		if (cand > best)
+			best = cand;
+		clear_base_stratum_data(&adata);
+	}
+
+	return best;
+}
+
+/*
+ * Filter OIDs from rev_list_out that already exist in any base-stratum
+ * pack — regardless of which anchor wrote it. Two anchors that share
+ * history would otherwise pack the shared objects twice (once each);
+ * with this cross-anchor filter, each shared object lands in whichever
+ * pack is written first, and later packs in the same run (or in
+ * subsequent runs) carry only their own deltas relative to the
+ * already-stratified union. The per-repo union of base-stratum packs
+ * remains closed under reachability from any configured anchor — the
+ * weaker guarantee than per-anchor closure, which is what cascade
+ * demotion relies on (and which still holds: a demoted pack's .pack
+ * file stays on disk and gets absorbed by the next geometric repack).
  *
  * Returns the number of OIDs filtered out.
  */
-static size_t filter_already_packed_oids(struct strbuf *rev_list_out,
-					 const char *anchor_ref)
+static size_t filter_already_packed_oids(struct strbuf *rev_list_out)
 {
 	struct packed_git **existing = NULL;
 	size_t existing_nr = 0, existing_alloc = 0;
@@ -1909,20 +2027,9 @@ static size_t filter_already_packed_oids(struct strbuf *rev_list_out,
 	const char *cur, *end;
 	size_t filtered_count = 0;
 
-	/* Collect base-stratum packs for this anchor ref */
 	repo_for_each_pack(the_repository, p) {
-		struct base_stratum_data adata = { 0 };
-
 		if (!p->in_base_stratum)
 			continue;
-		if (load_pack_base_stratum(p, &adata))
-			continue;
-		if (!adata.anchor_ref || strcmp(adata.anchor_ref, anchor_ref)) {
-			clear_base_stratum_data(&adata);
-			continue;
-		}
-		clear_base_stratum_data(&adata);
-
 		if (open_pack_index(p))
 			continue;
 
@@ -2088,8 +2195,14 @@ static int maintenance_task_stratify(struct maintenance_run_opts *opts,
 		}
 		oidset_insert(&stratified_oids, &tip_oid);
 
-		/* Find the last-stratified commit for this anchor */
-		last_stratified = find_last_stratified_commit(anchor_ref);
+		/*
+		 * Find the most-advanced base-stratum frontier on this
+		 * anchor's history, regardless of which anchor first
+		 * stratified it. If another configured anchor's pack
+		 * already covers a prefix of our reachables, use its
+		 * anchor_commit as ^bound to skip the walk.
+		 */
+		last_stratified = find_stratified_ancestor(r, &tip_oid);
 
 		/*
 		 * Use rev-list to find objects reachable from the anchor
@@ -2252,15 +2365,16 @@ static int maintenance_task_stratify(struct maintenance_run_opts *opts,
 		}
 
 		/*
-		 * Filter out objects that already exist in base-stratum packs
-		 * for this ref. This makes each pack truly incremental,
-		 * avoiding duplication even when ^<last_stratified> fails to
-		 * exclude all previously packed objects (e.g., after cascade
-		 * demotion resets the stratified frontier).
+		 * Filter out objects that already exist in any base-stratum
+		 * pack (cross-anchor): two anchors that share history would
+		 * otherwise pack the shared objects twice. ^<last_stratified>
+		 * already excludes most of them via the rev-list bound, but
+		 * the OID-level filter handles the remainder, including the
+		 * case where last_stratified comes from a different anchor's
+		 * pack and so doesn't match this anchor's own ^bound history.
 		 */
 		{
-			size_t skipped = filter_already_packed_oids(&rev_list_out,
-								   anchor_ref);
+			size_t skipped = filter_already_packed_oids(&rev_list_out);
 			if (skipped) {
 				trace2_data_intmax("stratify", r,
 						   "objects/already-packed",
@@ -2363,7 +2477,20 @@ static int maintenance_task_stratify(struct maintenance_run_opts *opts,
 		}
 		pack_path = xstrfmt("%s.idx", pack_prefix);
 
-		new_pack = add_packed_git(r, pack_path, strlen(pack_path), 1);
+		/*
+		 * Register the new pack with the in-memory packfile store
+		 * so that subsequent iterations of this loop (and any
+		 * helpers we call below) see it via repo_for_each_pack.
+		 * Without this, the cross-anchor filter cannot tell that
+		 * the pack we just wrote already covers the next anchor's
+		 * shared objects.
+		 */
+		{
+			struct odb_source_files *files =
+				odb_source_files_downcast(r->objects->sources);
+			new_pack = packfile_store_load_pack(files->packed,
+							    pack_path, 1);
+		}
 		if (new_pack) {
 			write_pack_base_stratum(new_pack, &tip_oid,
 					    anchor_ref,
@@ -2562,7 +2689,12 @@ static int maintenance_task_consolidate_stratum(
 			free(full_prefix);
 		}
 		pack_path = xstrfmt("%s.idx", pack_prefix);
-		new_pack = add_packed_git(r, pack_path, strlen(pack_path), 1);
+		{
+			struct odb_source_files *files =
+				odb_source_files_downcast(r->objects->sources);
+			new_pack = packfile_store_load_pack(files->packed,
+							    pack_path, 1);
+		}
 		free(pack_path);
 		free(pack_prefix);
 		strbuf_release(&pack_hash);
@@ -2770,58 +2902,34 @@ static int stratify_stratifying_caught_up(struct repository *r, int quiet)
 
 	for (i = 0; i < anchors.nr; i++) {
 		const char *anchor_ref = anchors.items[i].string;
-		struct packed_git *p;
-		struct object_id *best_oid = NULL;
-		uint32_t best_ts = 0;
 		struct object_id tip_oid;
-		int have_tip;
-		struct commit *commit;
+		timestamp_t frontier_date;
 
-		have_tip = !!refs_resolve_ref_unsafe(get_main_ref_store(r),
-						     anchor_ref,
-						     RESOLVE_REF_READING,
-						     &tip_oid, NULL);
-
-		/*
-		 * Find the most recent stratified commit covering this
-		 * anchor. Prefer a sidecar whose anchor_ref matches; if
-		 * none exists, accept a sidecar from a different anchor
-		 * whose anchor_commit equals this anchor's current tip.
-		 *
-		 * The fallback handles OID-level dedup: when stratify
-		 * skips an anchor because a prior anchor in the same run
-		 * resolved to the same commit, the prior anchor's pack
-		 * fully covers this anchor's reachable history. Treat
-		 * that pack as evidence that this anchor is caught up.
-		 */
-		repo_for_each_pack(r, p) {
-			struct base_stratum_data adata = { 0 };
-			int direct_match, oid_match;
-
-			if (!p->in_base_stratum)
-				continue;
-			if (load_pack_base_stratum(p, &adata))
-				continue;
-
-			direct_match = adata.anchor_ref &&
-				       !strcmp(adata.anchor_ref, anchor_ref);
-			oid_match = have_tip &&
-				    oideq(&adata.anchor_commit, &tip_oid);
-
-			if (!direct_match && !oid_match) {
-				clear_base_stratum_data(&adata);
-				continue;
-			}
-			if (adata.stratified_timestamp > best_ts) {
-				free(best_oid);
-				best_oid = xmalloc(sizeof(*best_oid));
-				oidcpy(best_oid, &adata.anchor_commit);
-				best_ts = adata.stratified_timestamp;
-			}
-			clear_base_stratum_data(&adata);
+		if (!refs_resolve_ref_unsafe(get_main_ref_store(r),
+					     anchor_ref,
+					     RESOLVE_REF_READING,
+					     &tip_oid, NULL)) {
+			if (!quiet)
+				fprintf(stderr,
+					_("surface-gc: cannot resolve anchor '%s'\n"),
+					anchor_ref);
+			ret = 0;
+			goto out;
 		}
 
-		if (!best_oid) {
+		/*
+		 * Cross-anchor frontier lookup: any base-stratum pack
+		 * whose anchor_commit lies on this anchor's history
+		 * (ancestor of, or descendant containing, our tip)
+		 * contributes to our coverage. The descendant case
+		 * means another anchor's deeper pack fully covers our
+		 * history; the ancestor case means partial coverage up
+		 * to that anchor_commit. Pick the most recent such
+		 * frontier date.
+		 */
+		frontier_date = stratified_frontier_date(r, &tip_oid);
+
+		if (!frontier_date) {
 			if (!quiet)
 				fprintf(stderr,
 					_("surface-gc: anchor '%s' has no stratified commits yet\n"),
@@ -2830,27 +2938,14 @@ static int stratify_stratifying_caught_up(struct repository *r, int quiet)
 			goto out;
 		}
 
-		commit = lookup_commit(r, best_oid);
-		free(best_oid);
-
-		if (!commit || repo_parse_commit(r, commit)) {
-			if (!quiet)
-				fprintf(stderr,
-					_("surface-gc: cannot parse stratified commit for '%s'\n"),
-					anchor_ref);
-			ret = 0;
-			goto out;
-		}
-
-		if (commit->date < cutoff_ts) {
+		if (frontier_date < cutoff_ts) {
 			if (!quiet)
 				fprintf(stderr,
 					_("surface-gc: skipped, stratifying for '%s' is lagging "
-				  "(stratified up to %s [%s], need commits newer than "
+				  "(stratified up to [%s], need commits newer than "
 				  "stratify.min-age(%s) + surface-gc.grace-period(%s))\n"),
 				anchor_ref,
-				oid_to_hex(&commit->object.oid),
-				show_date(commit->date, 0, DATE_MODE(SHORT)),
+				show_date(frontier_date, 0, DATE_MODE(SHORT)),
 				min_age_str, grace_str);
 			ret = 0;
 			goto out;

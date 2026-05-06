@@ -143,30 +143,52 @@ For each base-stratum pack:
 Demotion means deleting the `.base-stratum` file. The pack becomes a regular
 pack and is handled by geometric repack on the next run.
 
-Cascade demotion
-^^^^^^^^^^^^^^^^
+Independent validation
+^^^^^^^^^^^^^^^^^^^^^^
 
-Base-stratum packs for the same anchor ref form an incremental chain: each
-pack is created with `^<last_stratified>` exclusion, so it depends on earlier
-packs for objects that were already stratified. If a pack in the middle of
-the chain fails validation (e.g., the anchor ref was force-pushed), all
-packs for the same anchor ref with equal or later `stratified_timestamp` must
-also be demoted. Without cascade demotion, the surviving packs would have
-dangling references to objects that are now in the active stratum,
-breaking the closed-set property.
+Each base-stratum pack in an anchor ref's group is validated
+independently against the current ref tip. If a pack's recorded
+`anchor_commit` is no longer an ancestor of the ref (force-push, ref
+deletion), the pack's `.base-stratum` and `.keep` sidecars are removed.
+The `.pack` and `.idx` files stay on disk and are absorbed by the next
+geometric repack on its normal cadence; cascade-by-timestamp ordering is
+not used (it relied on a fragile assumption that
+`stratified_timestamp` order matches commit-graph order, which clock
+skew, manual sidecar edits, or future timestamp-inheriting code paths
+can break).
 
-Validation processes packs grouped by anchor ref in `stratified_timestamp`
-order. On the first failure within a group, all remaining packs in that
-group are demoted. Different anchor refs are independent — a failure in
-one does not affect the other.
+After demotion, the stratify task re-stratifies from scratch on the next
+run. The cross-anchor coverage lookup (see below) ensures any prefix of
+the ref's history that's still pinned by some other anchor's pack is
+not re-walked.
 
-After cascade demotion, the stratify task starts stratifying from scratch
-for that anchor ref. Surface-gc skips its run until the stratifying frontier
-passes the `min-age + grace-period` threshold again; regular geometric
-repack handles the active stratum packs in the meantime.
+This is cheap: one ancestor check per base-stratum pack via
+`repo_in_merge_bases()`, accelerated to near-constant time by the
+commit graph.
 
-This is cheap: one ancestor check per base-stratum pack, accelerated to
-near-constant time by the commit graph.
+Cross-anchor coverage and the closed-set property
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+When two anchors share history (a release branch that branched from
+main, a tag pointing at an old main commit, etc.) the shared objects
+are stratified once into whichever pack lands first; later packs in the
+same run, and packs created by subsequent runs, filter against the
+union of *all* base-stratum packs and only carry their own
+unique-to-anchor deltas.
+
+The closed-set property therefore holds at the *repository* level — the
+union of all base-stratum packs is closed under reachability from any
+configured anchor — rather than per anchor. The weaker per-anchor
+guarantee is not needed: a demoted pack's `.pack` file remains on disk
+until the next geometric repack absorbs it, so its objects are never
+lost between demotion and absorption. Surface-gc may walk further on
+the cycle following a demotion (the demoted pack is no longer a kept
+boundary), but reachability is preserved throughout.
+
+The same cross-anchor lookup powers `find_stratified_ancestor()`, which
+the per-anchor stratify loop uses to bound its rev-list (`^<bound>`):
+if some other configured anchor's pack already covers a prefix of this
+anchor's history, walking that prefix again is wasted work.
 
 
 The surface-gc maintenance task
@@ -214,12 +236,16 @@ pack, it marks it seen and does not recurse further.
 
 This relies on the *closed-set property*: the union of all base-stratum
 packs is closed under object reachability. Every object transitively
-reachable from a stratified object is guaranteed to be in some base-stratum
-pack, because base-stratum packs are created by `rev-list --objects` which
-enumerates the full transitive closure. The `^<last_stratified>` exclusion
-means individual packs are not self-contained, but the union across all
-packs for an anchor ref is. Cascade demotion (see Validation above)
-preserves this property after force-pushes.
+reachable from any configured anchor is guaranteed to be in some
+base-stratum pack, because base-stratum packs are created by
+`rev-list --objects` which enumerates the full transitive closure, and
+the cross-anchor filter ensures shared history is stratified exactly
+once into the union. The `^<last_stratified>` exclusion means
+individual packs are not self-contained, but the union is. Demotion
+(see Validation above) preserves this property: a demoted pack's
+`.pack` file remains on disk and is folded into the active stratum by
+the next geometric repack, so objects never disappear between demotion
+and absorption.
 
 If main's history is stratified up to 2 weeks ago, the walk only needs to
 traverse approximately 2 weeks of commits before hitting stratified objects

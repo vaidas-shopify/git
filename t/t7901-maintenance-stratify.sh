@@ -40,13 +40,20 @@ extract_sidecar_refs () {
 	EOF
 }
 
-# Configure two anchors that point at different commits, so OID-level
-# dedup does not collapse them into one pack. Used by orphan/prune tests
-# that need each anchor to have its own sidecar.
+# Configure two anchors that point at sibling commits — they share a
+# common base (c1) but each has its own unique commit beyond it. This
+# avoids both OID-level dedup (which collapses same-OID anchors) and
+# the cross-anchor filter eating one anchor's pack entirely (which
+# happens when one anchor is a strict ancestor of the other). Each
+# anchor still gets its own pack with anchor-unique objects only;
+# the shared base lands in whichever pack is written first.
 setup_two_distinct_anchors () {
 	test_commit --no-tag c1 &&
 	git branch release HEAD &&
 	test_commit --no-tag c2 &&
+	git checkout -q release &&
+	test_commit --no-tag r1 &&
+	git checkout -q master &&
 
 	git config --add maintenance.stratified.anchor refs/heads/master &&
 	git config --add maintenance.stratified.anchor refs/heads/release
@@ -104,6 +111,51 @@ test_expect_success 'two anchors at same commit are deduped to one pack' '
 		extract_sidecar_refs >actual &&
 		echo refs/heads/master >expect &&
 		test_cmp expect actual
+	)
+'
+
+test_expect_success 'cross-anchor filter dedupes shared history' '
+	test_create_repo cross-anchor-shared &&
+	(
+		cd cross-anchor-shared &&
+
+		# Create two anchors with overlapping history. release
+		# is a strict ancestor of master: release at c1, master
+		# at c2 (child of c1). Without the cross-anchor filter,
+		# both packs would carry c1'\''s objects. With it, the
+		# anchor processed second skips them entirely.
+		test_commit --no-tag c1 &&
+		git branch release HEAD &&
+		test_commit --no-tag c2 &&
+
+		git config --add maintenance.stratified.anchor refs/heads/master &&
+		git config --add maintenance.stratified.anchor refs/heads/release &&
+
+		git maintenance run --task=stratify --no-quiet 2>err &&
+
+		# Master is processed first (config order) and writes a
+		# full pack covering c1+c2. Release sees its rev-list
+		# output (c1 only) entirely filtered against the just-
+		# written master pack and produces no pack of its own.
+		# The trace2 stream records the full skip on the
+		# already-packed objects line.
+		test 1 -eq $(count_sidecars) &&
+		extract_sidecar_refs >actual &&
+		echo refs/heads/master >expect &&
+		test_cmp expect actual &&
+		test_grep "objects already in base-stratum packs" err &&
+
+		# Surface-gc readiness for release must still report
+		# release as caught up — master'\''s pack covers all of
+		# release'\''s reachables (master is a descendant of
+		# release'\''s tip). Without the descendant fallback in
+		# stratified_frontier_date(), readiness would say
+		# "no stratified commits yet" and surface-gc would skip
+		# indefinitely.
+		git config maintenance.stratified.min-age "now" &&
+		git config maintenance.stratified.grace-period "now" &&
+		git maintenance run --task=surface-gc --no-quiet 2>err2 &&
+		! grep "no stratified commits yet" err2
 	)
 '
 
