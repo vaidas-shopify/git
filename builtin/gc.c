@@ -2209,11 +2209,23 @@ static int maintenance_task_stratify(struct maintenance_run_opts *opts,
 		 * ref (up to min-age) that are not reachable from the
 		 * last-stratified commit.
 		 *
-		 * git rev-list --objects --before=<min-age> <tip> [^<last_stratified>]
+		 * --in-commit-order is required for the batch-size
+		 * truncation below to work: without it, rev-list emits
+		 * all commits first and then all reachable trees and
+		 * blobs, so there are no inline commit boundaries to
+		 * truncate at and the trees/blobs of an included commit
+		 * would be cut off. With it, each commit is followed by
+		 * the trees and blobs reached through that commit, so
+		 * we can truncate at the next commit line and the
+		 * preserved prefix has full object closure for the
+		 * commits it includes.
+		 *
+		 * git rev-list --objects --in-commit-order --reverse \
+		 *	--before=<min-age> <tip> [^<last_stratified>]
 		 */
 		rev_list.git_cmd = 1;
 		strvec_pushl(&rev_list.args, "rev-list", "--objects",
-			     "--reverse", NULL);
+			     "--in-commit-order", "--reverse", NULL);
 		strvec_pushf(&rev_list.args, "--before=%"PRItime, min_age_ts);
 		strvec_push(&rev_list.args, oid_to_hex(&tip_oid));
 		if (last_stratified)
@@ -2291,9 +2303,19 @@ static int maintenance_task_stratify(struct maintenance_run_opts *opts,
 			int truncated = 0;
 			unsigned long obj_count = 0;
 			int batch_exceeded = 0;
-			struct object_id batch_anchor;
+			/*
+			 * batch_anchor tracks the last *fully-included*
+			 * commit; pending_anchor tracks the commit
+			 * currently being scanned, which is only known to
+			 * be fully included once we cross into the next
+			 * commit (or rev-list output ends) without having
+			 * exceeded the batch.
+			 */
+			struct object_id batch_anchor = { 0 };
 			int have_batch_anchor = 0;
-			size_t last_commit_boundary = 0;
+			struct object_id pending_anchor;
+			int have_pending_anchor = 0;
+			size_t pending_commit_offset = 0;
 
 			while (p < rev_list_out.buf + rev_list_out.len) {
 				const char *eol = memchr(p, '\n', rev_list_out.buf + rev_list_out.len - p);
@@ -2302,22 +2324,54 @@ static int maintenance_task_stratify(struct maintenance_run_opts *opts,
 
 				/* Commit lines have no space (just hex OID) */
 				if (!memchr(p, ' ', eol - p)) {
-					/*
-					 * We hit a new commit. If we already
-					 * exceeded the batch limit, truncate
-					 * at the previous commit boundary so
-					 * all objects from the last included
-					 * commit are present.
-					 */
 					if (batch_exceeded) {
-						strbuf_setlen(&rev_list_out,
-							      last_commit_boundary);
+						/*
+						 * The pending commit pushed
+						 * us over: drop it from the
+						 * batch and record the prior
+						 * fully-included commit as
+						 * the anchor.
+						 *
+						 * If there is no prior
+						 * fully-included commit (a
+						 * single commit alone exceeds
+						 * the batch), truncating
+						 * would leave the batch
+						 * empty and stratification
+						 * would never advance.
+						 * Promote the pending commit
+						 * and overshoot instead, so
+						 * the run still makes
+						 * progress.
+						 */
+						if (have_batch_anchor) {
+							strbuf_setlen(&rev_list_out,
+								      pending_commit_offset);
+						} else {
+							if (have_pending_anchor) {
+								oidcpy(&batch_anchor,
+								       &pending_anchor);
+								have_batch_anchor = 1;
+							}
+							strbuf_setlen(&rev_list_out,
+								      p - rev_list_out.buf);
+						}
 						truncated = 1;
 						break;
 					}
-					last_commit_boundary = p - rev_list_out.buf;
-					if (get_oid_hex(p, &batch_anchor) == 0)
+					/*
+					 * Crossing into a new commit confirms
+					 * the previously-pending commit is
+					 * fully included; promote it and
+					 * start tracking the new one.
+					 */
+					if (have_pending_anchor) {
+						oidcpy(&batch_anchor, &pending_anchor);
 						have_batch_anchor = 1;
+					}
+					pending_commit_offset = p - rev_list_out.buf;
+					if (get_oid_hex(p, &pending_anchor) == 0)
+						have_pending_anchor = 1;
 				}
 
 				obj_count++;
@@ -2328,20 +2382,25 @@ static int maintenance_task_stratify(struct maintenance_run_opts *opts,
 			}
 
 			/*
-			 * If we exceeded the batch but never hit another
-			 * commit to trigger truncation, all remaining
-			 * objects belong to the last commit — include them.
+			 * Loop ended without truncating: the pending
+			 * commit's objects were fully consumed by rev-list
+			 * output, so it counts as fully included. This also
+			 * covers the case where the batch was exceeded
+			 * mid-way through the very last commit — we include
+			 * the remainder rather than truncate mid-commit.
+			 *
+			 * Always use the last fully-included commit as the
+			 * anchor, not the ref tip. The rev-list is bounded
+			 * by --before=<min-age>, so the last commit
+			 * represents the actual stratified frontier. Using
+			 * the ref tip would skip objects that are currently
+			 * newer than min-age but will become eligible in
+			 * future runs as time passes.
 			 */
-
-			/*
-			 * Always use the last commit in the rev-list output
-			 * as the anchor, not the ref tip. The rev-list is
-			 * bounded by --before=<min-age>, so the last commit
-			 * represents the actual stratified frontier. Using the
-			 * ref tip would skip objects that are currently newer
-			 * than min-age but will become eligible in future runs
-			 * as time passes.
-			 */
+			if (!truncated && have_pending_anchor) {
+				oidcpy(&batch_anchor, &pending_anchor);
+				have_batch_anchor = 1;
+			}
 			if (have_batch_anchor)
 				oidcpy(&tip_oid, &batch_anchor);
 

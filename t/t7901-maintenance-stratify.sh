@@ -40,6 +40,20 @@ extract_sidecar_refs () {
 	EOF
 }
 
+# Print the anchor_commit OID recorded in the sidecar at $1.
+extract_sidecar_anchor () {
+	perl - "$1" <<-\EOF
+		my $path = $ARGV[0];
+		open my $fh, "<", $path or die "open $path: $!";
+		binmode $fh;
+		my $buf;
+		read $fh, $buf, -s $path;
+		my $hash_id = unpack("N", substr($buf, 8, 4));
+		my $rawsz = ($hash_id == 1) ? 20 : 32;
+		print unpack("H*", substr($buf, 12, $rawsz)), "\n";
+	EOF
+}
+
 # Configure two anchors that point at sibling commits — they share a
 # common base (c1) but each has its own unique commit beyond it. This
 # avoids both OID-level dedup (which collapses same-OID anchors) and
@@ -194,6 +208,72 @@ test_expect_success 'second stratify run with distinct anchors is a no-op' '
 		git maintenance run --task=stratify --quiet &&
 		test 2 -eq $(count_sidecars) &&
 		test 2 -eq $(count_packs)
+	)
+'
+
+test_expect_success 'batch-size truncation records the last fully-included commit' '
+	test_create_repo batch-truncate-anchor &&
+	(
+		cd batch-truncate-anchor &&
+
+		# Three commits, each adding one new file: 1 commit + 1
+		# root tree + 1 blob = 3 objects per commit, so 9 objects
+		# total. With --in-commit-order, rev-list emits each
+		# commit followed by its trees and blobs.
+		test_commit --no-tag c1 &&
+		c1_oid=$(git rev-parse HEAD) &&
+		test_commit --no-tag c2 &&
+		test_commit --no-tag c3 &&
+
+		git config --add maintenance.stratified.anchor refs/heads/master &&
+
+		# batch-size=4 trips while processing c2 (commit line is
+		# the 4th object) and truncation happens when we reach
+		# c3. Only c1 and its tree/blob make it into the pack;
+		# the anchor must record c1 (the last fully-included
+		# commit), not c2.
+		git config maintenance.stratified.batch-size 4 &&
+		git maintenance run --task=stratify --quiet &&
+
+		test 1 -eq $(count_sidecars) &&
+		sc=$(ls .git/objects/pack/*.base-stratum) &&
+		extract_sidecar_anchor "$sc" >actual &&
+		echo "$c1_oid" >expect &&
+		test_cmp expect actual &&
+
+		# A follow-up run with no batch limit must pick up where
+		# the previous one left off and stratify the rest. With
+		# the buggy frontier, ^c2 would have permanently hidden
+		# c2 from the next walk.
+		git config --unset maintenance.stratified.batch-size &&
+		git maintenance run --task=stratify --quiet &&
+		test 2 -eq $(count_sidecars)
+	)
+'
+
+test_expect_success 'batch-size smaller than a single commit still makes progress' '
+	test_create_repo batch-single-commit &&
+	(
+		cd batch-single-commit &&
+
+		# A single commit alone produces 3 objects (commit, root
+		# tree, blob); batch-size=2 cannot hold even one commit.
+		# The task must still advance the frontier — silently
+		# emitting an empty batch would mean stratification can
+		# never complete on this repo.
+		test_commit --no-tag c1 &&
+		c1_oid=$(git rev-parse HEAD) &&
+		test_commit --no-tag c2 &&
+
+		git config --add maintenance.stratified.anchor refs/heads/master &&
+		git config maintenance.stratified.batch-size 2 &&
+
+		git maintenance run --task=stratify --quiet &&
+		test 1 -eq $(count_sidecars) &&
+		sc=$(ls .git/objects/pack/*.base-stratum) &&
+		extract_sidecar_anchor "$sc" >actual &&
+		echo "$c1_oid" >expect &&
+		test_cmp expect actual
 	)
 '
 
