@@ -49,6 +49,7 @@
 #include "setup.h"
 #include "trace2.h"
 #include "worktree.h"
+#include "oidset.h"
 
 #define FAILED_RUN "failed to run %s"
 
@@ -2028,6 +2029,7 @@ static int maintenance_task_stratify(struct maintenance_run_opts *opts,
 {
 	struct repository *r = the_repository;
 	struct string_list anchors = STRING_LIST_INIT_DUP;
+	struct oidset stratified_oids = OIDSET_INIT;
 	const char *min_age_str = "2.weeks.ago";
 	timestamp_t min_age_ts;
 	unsigned long batch_size = 0;
@@ -2078,6 +2080,33 @@ static int maintenance_task_stratify(struct maintenance_run_opts *opts,
 			trace2_region_leave("stratify", anchor_ref, r);
 			continue;
 		}
+
+		/*
+		 * OID-level dedup: if a prior anchor in this run already
+		 * stratified the same tip OID, the resulting pack covers
+		 * the identical reachable object set. Walking and packing
+		 * this anchor's history again would just produce a
+		 * byte-equivalent pack under a different filename. Skip
+		 * the work; surface-gc readiness for this anchor is
+		 * resolved via the prior anchor's sidecar (see
+		 * stratify_stratifying_caught_up).
+		 *
+		 * Once the anchors diverge in OID (e.g., the primary
+		 * advances), the follower is no longer deduped and gets
+		 * its own stratification on the next run.
+		 */
+		if (oidset_contains(&stratified_oids, &tip_oid)) {
+			if (!opts->quiet)
+				fprintf(stderr,
+					_("stratify: '%s' resolves to a commit "
+					  "already stratified by another anchor "
+					  "in this run; skipping\n"), anchor_ref);
+			trace2_data_string("stratify", r, "skipped/reason",
+					   "duplicate-oid");
+			trace2_region_leave("stratify", anchor_ref, r);
+			continue;
+		}
+		oidset_insert(&stratified_oids, &tip_oid);
 
 		/* Find the last-stratified commit for this anchor */
 		last_stratified = find_last_stratified_commit(anchor_ref);
@@ -2369,6 +2398,7 @@ static int maintenance_task_stratify(struct maintenance_run_opts *opts,
 		trace2_region_leave("stratify", anchor_ref, r);
 	}
 
+	oidset_clear(&stratified_oids);
 	string_list_clear(&anchors, 0);
 	return result;
 }
@@ -2763,18 +2793,42 @@ static int stratify_stratifying_caught_up(struct repository *r, int quiet)
 		struct packed_git *p;
 		struct object_id *best_oid = NULL;
 		uint32_t best_ts = 0;
+		struct object_id tip_oid;
+		int have_tip;
 		struct commit *commit;
 
-		/* Find the most recent stratified commit for this anchor */
+		have_tip = !!refs_resolve_ref_unsafe(get_main_ref_store(r),
+						     anchor_ref,
+						     RESOLVE_REF_READING,
+						     &tip_oid, NULL);
+
+		/*
+		 * Find the most recent stratified commit covering this
+		 * anchor. Prefer a sidecar whose anchor_ref matches; if
+		 * none exists, accept a sidecar from a different anchor
+		 * whose anchor_commit equals this anchor's current tip.
+		 *
+		 * The fallback handles OID-level dedup: when stratify
+		 * skips an anchor because a prior anchor in the same run
+		 * resolved to the same commit, the prior anchor's pack
+		 * fully covers this anchor's reachable history. Treat
+		 * that pack as evidence that this anchor is caught up.
+		 */
 		repo_for_each_pack(r, p) {
 			struct base_stratum_data adata = { 0 };
+			int direct_match, oid_match;
 
 			if (!p->in_base_stratum)
 				continue;
 			if (load_pack_base_stratum(p, &adata))
 				continue;
-			if (!adata.anchor_ref ||
-			    strcmp(adata.anchor_ref, anchor_ref)) {
+
+			direct_match = adata.anchor_ref &&
+				       !strcmp(adata.anchor_ref, anchor_ref);
+			oid_match = have_tip &&
+				    oideq(&adata.anchor_commit, &tip_oid);
+
+			if (!direct_match && !oid_match) {
 				clear_base_stratum_data(&adata);
 				continue;
 			}

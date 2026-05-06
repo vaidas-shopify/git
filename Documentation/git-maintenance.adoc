@@ -204,6 +204,15 @@ ones: if an anchor ref has been deleted or force-pushed past the
 recorded anchor commit, the corresponding pack is demoted to a regular
 pack by removing its `.base-stratum` file.
 +
+Anchors are also deduplicated at the OID level within a single run.
+If two configured anchors resolve to the same commit (for example,
+`refs/heads/main` and a release branch that was just cut from it), only
+the first-listed anchor is stratified; the second is recorded as
+`skipped/reason=duplicate-oid` in trace2 output. The follower's
+surface-gc readiness check is satisfied by the primary's sidecar via an
+OID-equivalence fallback, so the dedup is transparent. Once the anchors
+diverge in OID, the follower stratifies independently on the next run.
++
 The task requires at least one `maintenance.stratified.anchor` to be
 configured; it is a no-op otherwise.
 

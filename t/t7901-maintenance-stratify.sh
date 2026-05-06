@@ -40,50 +40,78 @@ extract_sidecar_refs () {
 	EOF
 }
 
-test_expect_success 'two anchors at same commit get distinct packs' '
+# Configure two anchors that point at different commits, so OID-level
+# dedup does not collapse them into one pack. Used by orphan/prune tests
+# that need each anchor to have its own sidecar.
+setup_two_distinct_anchors () {
+	test_commit --no-tag c1 &&
+	git branch release HEAD &&
+	test_commit --no-tag c2 &&
+
+	git config --add maintenance.stratified.anchor refs/heads/master &&
+	git config --add maintenance.stratified.anchor refs/heads/release
+}
+
+test_expect_success 'two anchors at same commit are deduped to one pack' '
 	test_create_repo two-anchor-same-commit &&
 	(
 		cd two-anchor-same-commit &&
 		test_commit --no-tag c1 &&
 		test_commit --no-tag c2 &&
 
-		# Two refs pointing at the same commit
+		# Two refs pointing at the same commit.
 		git update-ref refs/heads/release HEAD &&
 
 		git config --add maintenance.stratified.anchor refs/heads/master &&
 		git config --add maintenance.stratified.anchor refs/heads/release &&
 
+		git maintenance run --task=stratify --no-quiet 2>err &&
+
+		# Only one pack is written; the second anchor is skipped
+		# because its tip OID was already stratified by the first.
+		test 1 -eq $(count_sidecars) &&
+		test 1 -eq $(count_packs) &&
+		test_grep "already stratified by another anchor" err &&
+
+		# The surviving sidecar records the first-listed anchor.
+		extract_sidecar_refs >actual &&
+		echo refs/heads/master >expect &&
+		test_cmp expect actual
+	)
+'
+
+test_expect_success 'distinct anchors get distinct anchor-scoped pack files' '
+	test_create_repo two-anchor-distinct &&
+	(
+		cd two-anchor-distinct &&
+		setup_two_distinct_anchors &&
+
 		git maintenance run --task=stratify --quiet &&
 
+		# Each anchor at a different OID produces its own pack and
+		# sidecar; pack basenames are anchor-scoped so even if the
+		# packs ever produced identical content the filenames
+		# would not collide.
 		test 2 -eq $(count_sidecars) &&
+		test 2 -eq $(count_packs) &&
 
-		# Each sidecar must record a different anchor_ref. If the
-		# packs collided on the same path, the second write would
-		# have overwritten the first sidecar, leaving only one.
 		extract_sidecar_refs >actual &&
 		printf "refs/heads/master\nrefs/heads/release\n" >expect &&
 		test_cmp expect actual
 	)
 '
 
-test_expect_success 'second stratify run preserves both anchors sidecars' '
+test_expect_success 'second stratify run with distinct anchors is a no-op' '
 	test_create_repo two-anchor-incremental &&
 	(
 		cd two-anchor-incremental &&
-		test_commit --no-tag c1 &&
-		test_commit --no-tag c2 &&
-		git update-ref refs/heads/release HEAD &&
-
-		git config --add maintenance.stratified.anchor refs/heads/master &&
-		git config --add maintenance.stratified.anchor refs/heads/release &&
+		setup_two_distinct_anchors &&
 
 		git maintenance run --task=stratify --quiet &&
 		test 2 -eq $(count_sidecars) &&
 
-		# A re-run with no new commits should be a no-op for both
-		# anchors. If one sidecar had been clobbered by the other,
-		# the orphaned anchor would re-stratify from scratch and
-		# create another pack.
+		# Re-run with no new commits should not add packs or
+		# rewrite sidecars.
 		git maintenance run --task=stratify --quiet &&
 		test 2 -eq $(count_sidecars) &&
 		test 2 -eq $(count_packs)
@@ -94,12 +122,7 @@ test_expect_success 'orphan anchor is reported but not demoted by stratify' '
 	test_create_repo orphan-warns &&
 	(
 		cd orphan-warns &&
-		test_commit --no-tag c1 &&
-		test_commit --no-tag c2 &&
-		git update-ref refs/heads/release HEAD &&
-
-		git config --add maintenance.stratified.anchor refs/heads/master &&
-		git config --add maintenance.stratified.anchor refs/heads/release &&
+		setup_two_distinct_anchors &&
 		git maintenance run --task=stratify --quiet &&
 		test 2 -eq $(count_sidecars) &&
 
@@ -122,12 +145,7 @@ test_expect_success 'stratify-prune demotes orphan anchor packs' '
 	test_create_repo orphan-prune &&
 	(
 		cd orphan-prune &&
-		test_commit --no-tag c1 &&
-		test_commit --no-tag c2 &&
-		git update-ref refs/heads/release HEAD &&
-
-		git config --add maintenance.stratified.anchor refs/heads/master &&
-		git config --add maintenance.stratified.anchor refs/heads/release &&
+		setup_two_distinct_anchors &&
 		git maintenance run --task=stratify --quiet &&
 		test 2 -eq $(count_sidecars) &&
 
