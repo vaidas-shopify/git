@@ -2551,10 +2551,15 @@ static int maintenance_task_stratify(struct maintenance_run_opts *opts,
 							    pack_path, 1);
 		}
 		if (new_pack) {
-			write_pack_base_stratum(new_pack, &tip_oid,
-					    anchor_ref,
-					    (uint32_t)time(NULL));
-			new_pack->in_base_stratum = 1;
+			if (write_pack_base_stratum(new_pack, &tip_oid,
+						    anchor_ref,
+						    (uint32_t)time(NULL))) {
+				warning(_("stratify: failed to write base-stratum "
+					  "metadata for '%s'"), anchor_ref);
+				result = 1;
+			} else {
+				new_pack->in_base_stratum = 1;
+			}
 		}
 
 		free(pack_path);
@@ -2775,8 +2780,26 @@ static int maintenance_task_consolidate_stratum(
 					    anchor_ref, r);
 			continue;
 		}
-		write_pack_base_stratum(new_pack, &best_anchor,
-				    anchor_ref, best_timestamp);
+		if (write_pack_base_stratum(new_pack, &best_anchor,
+					    anchor_ref, best_timestamp)) {
+			/*
+			 * The merged pack file exists but its
+			 * .base-stratum sidecar (or .keep) was not
+			 * durably installed. Leave the source packs in
+			 * place so the anchor's objects remain reachable
+			 * through recognized base-stratum packs; the
+			 * orphaned merged pack is harmless and can be
+			 * cleaned up by a later run.
+			 */
+			warning(_("consolidate-stratify: failed to write "
+				  "base-stratum metadata for '%s'; keeping "
+				  "source packs"), anchor_ref);
+			free(packs);
+			result = 1;
+			trace2_region_leave("consolidate-stratum",
+					    anchor_ref, r);
+			continue;
+		}
 		new_pack->in_base_stratum = 1;
 
 		/* Remove the old packs that were merged */
