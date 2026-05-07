@@ -1892,7 +1892,13 @@ static struct object_id *find_stratified_ancestor(struct repository *r,
 	timestamp_t best_date = 0;
 	struct commit *tip_commit;
 
-	tip_commit = lookup_commit(r, tip_oid);
+	/*
+	 * tip_oid comes from refs_resolve_ref_unsafe(), which for an
+	 * annotated tag is the tag object's OID, not the commit it
+	 * points to. Peel through tags before looking up the commit so
+	 * tag-backed anchors are handled the same as branch tips.
+	 */
+	tip_commit = lookup_commit_reference_gently(r, tip_oid, 1);
 	if (!tip_commit || repo_parse_commit(r, tip_commit))
 		return NULL;
 
@@ -1963,7 +1969,8 @@ static timestamp_t stratified_frontier_date(struct repository *r,
 	timestamp_t best = 0;
 	struct commit *tip_commit;
 
-	tip_commit = lookup_commit(r, tip_oid);
+	/* See find_stratified_ancestor() for why we peel through tags. */
+	tip_commit = lookup_commit_reference_gently(r, tip_oid, 1);
 	if (!tip_commit || repo_parse_commit(r, tip_commit))
 		return 0;
 

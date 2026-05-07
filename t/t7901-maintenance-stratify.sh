@@ -211,6 +211,53 @@ test_expect_success 'second stratify run with distinct anchors is a no-op' '
 	)
 '
 
+test_expect_success 'annotated-tag anchor: incremental detection and surface-gc gating' '
+	test_create_repo annotated-tag-anchor &&
+	(
+		cd annotated-tag-anchor &&
+		test_commit --no-tag c1 &&
+		git tag -a -m "release v1" v1 &&
+
+		# Sanity-check: the tag must be annotated, otherwise
+		# refs/tags/v1 resolves directly to the commit and the
+		# bug under test cannot manifest.
+		tag_oid=$(git rev-parse refs/tags/v1) &&
+		commit_oid=$(git rev-parse refs/tags/v1^{commit}) &&
+		test "$tag_oid" != "$commit_oid" &&
+
+		git config --add maintenance.stratified.anchor refs/tags/v1 &&
+		git maintenance run --task=stratify --quiet &&
+		test 1 -eq $(count_sidecars) &&
+
+		# The sidecar records the peeled commit OID, not the tag
+		# object OID; rev-list emits commits, and the stratify
+		# task picks the last fully-included commit as the anchor.
+		sc=$(ls .git/objects/pack/*.base-stratum) &&
+		extract_sidecar_anchor "$sc" >actual &&
+		echo "$commit_oid" >expect &&
+		test_cmp expect actual &&
+
+		# A second stratify run with no new commits must be a
+		# no-op. find_stratified_ancestor() peels tip_oid through
+		# the tag to find last_stratified=commit_oid; without
+		# peeling, lookup_commit() rejects the tag OID, the
+		# helper returns NULL, and rev-list re-walks all history
+		# and writes a second pack.
+		git maintenance run --task=stratify --quiet &&
+		test 1 -eq $(count_sidecars) &&
+		test 1 -eq $(count_packs) &&
+
+		# surface-gc readiness: stratified_frontier_date() must
+		# also peel the tag, otherwise it reports "no stratified
+		# commits yet" and surface-gc skips indefinitely on
+		# tag-anchored repos.
+		git config maintenance.stratified.min-age "now" &&
+		git config maintenance.stratified.grace-period "now" &&
+		git maintenance run --task=surface-gc --no-quiet 2>err &&
+		! grep "no stratified commits yet" err
+	)
+'
+
 test_expect_success 'batch-size truncation records the last fully-included commit' '
 	test_create_repo batch-truncate-anchor &&
 	(
