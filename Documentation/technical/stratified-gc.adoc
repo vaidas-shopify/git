@@ -178,12 +178,22 @@ unique-to-anchor deltas.
 
 The closed-set property therefore holds at the *repository* level — the
 union of all base-stratum packs is closed under reachability from any
-configured anchor — rather than per anchor. The weaker per-anchor
-guarantee is not needed: a demoted pack's `.pack` file remains on disk
-until the next geometric repack absorbs it, so its objects are never
-lost between demotion and absorption. Surface-gc may walk further on
-the cycle following a demotion (the demoted pack is no longer a kept
-boundary), but reachability is preserved throughout.
+configured anchor — rather than per anchor. Maintaining the *union* as
+the closed set across an anchor retirement is the responsibility of
+`stratify-prune`: when an anchor is dropped from configuration, its
+packs may exclusively hold objects that other anchors' packs reference
+as ancestors. Unlinking the orphan's `.base-stratum` and `.keep`
+outright would make those shared ancestors invisible to surface-gc's
+`--kept-pack-boundary` walk, which stops at surviving kept packs and
+would never reach into a now-regular orphan pack. The next cruft
+repack would then misclassify the shared ancestors as cruft and prune
+them at expiration. To prevent this, `stratify-prune` *relabels* each
+orphan pack's `.base-stratum` sidecar to claim a surviving anchor as
+its `anchor_ref`. The pack stays kept, joins the survivor's group, and
+is later folded into the survivor's pack(s) by `consolidate-stratum`'s
+geometric merge. If no surviving anchor has any base-stratum pack of
+its own, no kept pack exists whose closure could be broken, so the
+orphan can simply be demoted (the historical behavior).
 
 The same cross-anchor lookup powers `find_stratified_ancestor()`, which
 the per-anchor stratify loop uses to bound its rev-list (`^<bound>`):
@@ -241,11 +251,11 @@ base-stratum pack, because base-stratum packs are created by
 `rev-list --objects` which enumerates the full transitive closure, and
 the cross-anchor filter ensures shared history is stratified exactly
 once into the union. The `^<last_stratified>` exclusion means
-individual packs are not self-contained, but the union is. Demotion
-(see Validation above) preserves this property: a demoted pack's
-`.pack` file remains on disk and is folded into the active stratum by
-the next geometric repack, so objects never disappear between demotion
-and absorption.
+individual packs are not self-contained, but the union is.
+`stratify-prune` preserves this invariant when retiring an anchor by
+relabeling the orphan pack's sidecar onto a surviving anchor instead
+of unlinking it; see "Cross-anchor coverage and the closed-set
+property" above for the rationale.
 
 If main's history is stratified up to 2 weeks ago, the walk only needs to
 traverse approximately 2 weeks of commits before hitting stratified objects

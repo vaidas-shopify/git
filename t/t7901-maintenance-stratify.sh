@@ -444,7 +444,7 @@ test_expect_success 'orphan anchor is reported but not demoted by stratify' '
 	)
 '
 
-test_expect_success 'stratify-prune demotes orphan anchor packs' '
+test_expect_success 'stratify-prune relabels orphan anchor packs to a surviving anchor' '
 	test_create_repo orphan-prune &&
 	(
 		cd orphan-prune &&
@@ -455,17 +455,23 @@ test_expect_success 'stratify-prune demotes orphan anchor packs' '
 		git config --unset-all maintenance.stratified.anchor &&
 		git config --add maintenance.stratified.anchor refs/heads/master &&
 
-		# Pack count is unchanged; only the .base-stratum and .keep
-		# sidecars for the orphaned anchor go away.
+		# Pack and sidecar counts are both unchanged: stratify-prune
+		# rewrites the orphan pack'\''s .base-stratum sidecar so it
+		# claims the surviving anchor (master). Dropping the sidecar
+		# outright would break the closed-set property under
+		# cross-anchor dedup — the orphan pack may exclusively hold
+		# objects that the surviving anchor'\''s pack references as
+		# ancestors.
 		before=$(count_packs) &&
-		git maintenance run --task=stratify-prune --quiet &&
+		git maintenance run --task=stratify-prune --no-quiet 2>err &&
+		test_grep "relabeled" err &&
 		after=$(count_packs) &&
 		test "$before" = "$after" &&
-		test 1 -eq $(count_sidecars) &&
+		test 2 -eq $(count_sidecars) &&
 
-		# The remaining sidecar belongs to the still-configured anchor.
+		# Both sidecars now belong to the surviving anchor.
 		extract_sidecar_refs >actual &&
-		echo refs/heads/master >expect &&
+		printf "refs/heads/master\nrefs/heads/master\n" >expect &&
 		test_cmp expect actual
 	)
 '
@@ -524,6 +530,72 @@ test_expect_success 'stratify-prune refuses to run with no configured anchors' '
 		git maintenance run --task=stratify-prune --no-quiet 2>err &&
 		test_grep "refusing to run" err &&
 		test 1 -eq $(count_sidecars)
+	)
+'
+
+test_expect_success 'shared-history anchors survive donor demotion and surface-gc' '
+	test_create_repo cross-anchor-survive &&
+	(
+		cd cross-anchor-survive &&
+		setup_two_distinct_anchors &&
+
+		# Cross-anchor dedup: master is processed first (config
+		# order) and packs c1+c2; release packs r1 only (c1 is
+		# already covered by master'\''s pack and gets filtered).
+		git maintenance run --task=stratify --quiet &&
+		test 2 -eq $(count_sidecars) &&
+
+		# c1 is the shared base. It is reachable from release via
+		# r1'\''s parent pointer but lives only in master'\''s pack.
+		c1=$(git rev-parse refs/heads/release^) &&
+
+		# Retire master entirely: drop config AND delete the ref.
+		# This is the configuration where the corruption window
+		# opens — with master'\''s ref still alive, surface-gc'\''s
+		# walk would reach c1 through master and mark it reachable
+		# even with --kept-pack-boundary.
+		git config --unset-all maintenance.stratified.anchor refs/heads/master &&
+		git update-ref -d refs/heads/master &&
+
+		# Real-world parity: in production the corruption window
+		# opens once reflog entries that pinned the deleted branch
+		# expire. release was branched from master at c1, so
+		# release@{1} still pins c1 right after the ref deletion;
+		# expiring all reflog entries now collapses what would
+		# otherwise be a multi-week timeline into one test step.
+		git reflog expire --expire=now --expire-unreachable=now --all &&
+
+		# stratify-prune must relabel master'\''s pack rather than
+		# drop its sidecars; otherwise the closed-set property
+		# breaks for release'\''s pack.
+		git maintenance run --task=stratify-prune --no-quiet 2>err &&
+		test_grep "relabeled" err &&
+		extract_sidecar_refs >actual &&
+		printf "refs/heads/release\nrefs/heads/release\n" >expect &&
+		test_cmp expect actual &&
+
+		# surface-gc'\''s readiness check compares the stratify
+		# frontier against (now - min-age - grace-period); against
+		# the suite'\''s 1970-dated commits the default cutoff is
+		# always lagging. min-age=@1 with grace=now puts the
+		# cutoff exactly at the frontier so the cruft repack
+		# actually runs.
+		git config maintenance.stratified.min-age "@1 +0000" &&
+		git config maintenance.stratified.grace-period now &&
+
+		# Force any newly-cruft objects to expire in the same
+		# invocation: cruft-expiration cuts off mtimes "older than
+		# X", and "tomorrow" is past now, so any object that
+		# surface-gc moves into a cruft pack in this run is
+		# immediately pruned. Without the relabel fix, c1 ends up
+		# in that cruft pack and disappears here.
+		git -c maintenance.stratified.cruft-expiration=tomorrow \
+			maintenance run --task=surface-gc --quiet &&
+
+		# c1 must still resolve, and the repository must remain
+		# self-consistent.
+		git cat-file -e $c1 &&
+		git fsck --strict
 	)
 '
 

@@ -2864,7 +2864,8 @@ static int maintenance_task_stratify_prune(struct maintenance_run_opts *opts,
 	struct repository *r = the_repository;
 	struct string_list ref_groups = STRING_LIST_INIT_DUP;
 	struct string_list configured = STRING_LIST_INIT_DUP;
-	size_t i, j, demoted = 0;
+	const char *target_anchor = NULL;
+	size_t i, j, demoted = 0, relabeled = 0;
 
 	if (load_unique_stratify_anchors(r, &configured)) {
 		/*
@@ -2890,6 +2891,31 @@ static int maintenance_task_stratify_prune(struct maintenance_run_opts *opts,
 	}
 
 	collect_base_stratum_pack_groups(r, &ref_groups);
+
+	/*
+	 * Pick a relabel target: the first surviving anchor whose group
+	 * already has at least one base-stratum pack. Cross-anchor dedup
+	 * means an orphan pack may exclusively hold objects that surviving
+	 * packs reference as ancestors; dropping its .base-stratum/.keep
+	 * outright would break the closed-set property under
+	 * --kept-pack-boundary and surface-gc would later classify those
+	 * shared ancestors as cruft. Relabel the orphan's sidecar onto a
+	 * surviving anchor instead, so the pack stays kept and joins the
+	 * survivor's group; consolidate-stratum's geometric merge folds it
+	 * in over time.
+	 *
+	 * If no surviving anchor has a pack of its own, no kept pack
+	 * exists whose closure could be broken, so the orphan can simply
+	 * be demoted (the historical behavior).
+	 */
+	for (i = 0; i < ref_groups.nr; i++) {
+		if (unsorted_string_list_has_string(&configured,
+						    ref_groups.items[i].string)) {
+			target_anchor = ref_groups.items[i].string;
+			break;
+		}
+	}
+
 	for (i = 0; i < ref_groups.nr; i++) {
 		struct base_stratum_pack_group *group = ref_groups.items[i].util;
 		const char *anchor = ref_groups.items[i].string;
@@ -2899,19 +2925,37 @@ static int maintenance_task_stratify_prune(struct maintenance_run_opts *opts,
 
 		trace2_region_enter("stratify-prune", anchor, r);
 		for (j = 0; j < group->nr; j++) {
-			if (!opts->quiet)
-				fprintf(stderr,
-					_("stratify-prune: demoting %s "
-					  "(anchor '%s' no longer configured)\n"),
-					pack_basename(group->entries[j].pack),
-					anchor);
-			remove_pack_base_stratum(group->entries[j].pack);
-			demoted++;
+			struct base_stratum_pack_entry *entry = &group->entries[j];
+
+			if (target_anchor &&
+			    !write_pack_base_stratum(entry->pack,
+						     &entry->anchor_commit,
+						     target_anchor,
+						     entry->stratified_timestamp)) {
+				if (!opts->quiet)
+					fprintf(stderr,
+						_("stratify-prune: relabeled %s "
+						  "(anchor '%s' no longer configured) "
+						  "to surviving anchor '%s'\n"),
+						pack_basename(entry->pack),
+						anchor, target_anchor);
+				relabeled++;
+			} else {
+				if (!opts->quiet)
+					fprintf(stderr,
+						_("stratify-prune: demoting %s "
+						  "(anchor '%s' no longer configured)\n"),
+						pack_basename(entry->pack),
+						anchor);
+				remove_pack_base_stratum(entry->pack);
+				demoted++;
+			}
 		}
-		trace2_data_intmax("stratify-prune", r, "packs/demoted-group",
+		trace2_data_intmax("stratify-prune", r, "packs/processed-group",
 				   group->nr);
 		trace2_region_leave("stratify-prune", anchor, r);
 	}
+	trace2_data_intmax("stratify-prune", r, "packs/relabeled", relabeled);
 	trace2_data_intmax("stratify-prune", r, "packs/demoted", demoted);
 
 	free_base_stratum_pack_groups(&ref_groups);
