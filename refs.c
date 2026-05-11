@@ -3385,15 +3385,23 @@ done:
 }
 
 /*
- * Restore ref storage from backup by moving files back.
+ * Restore ref storage from backup by moving files back. Returns 0 if every
+ * item present in the backup was successfully renamed into place, non-zero
+ * otherwise. The caller MUST NOT delete the backup directory when this
+ * returns non-zero: the backup may hold the only surviving copy of the
+ * worktree's refs.
  */
-static void restore_ref_storage_from_backup(const char *gitdir,
-					     const char *backup_dir,
-					     int is_main_worktree)
+static int restore_ref_storage_from_backup(const char *gitdir,
+					   const char *backup_dir,
+					   int is_main_worktree,
+					   struct strbuf *errbuf)
 {
 	struct strbuf from = STRBUF_INIT, to = STRBUF_INIT;
+	struct strbuf root_err = STRBUF_INIT;
 	const char **items = get_ref_storage_items(is_main_worktree);
 	size_t i;
+	int ret = 0;
+	int root_ret;
 
 	for (i = 0; items[i]; i++) {
 		const char *item = items[i];
@@ -3410,29 +3418,48 @@ static void restore_ref_storage_from_backup(const char *gitdir,
 
 		/* Remove what's currently there (new storage that failed) */
 		if (stat(to.buf, &st) == 0) {
-			if (S_ISDIR(st.st_mode))
-				remove_dir_recursively(&to, 0);
-			else
-				unlink(to.buf);
+			if (S_ISDIR(st.st_mode)) {
+				if (remove_dir_recursively(&to, 0) < 0) {
+					strbuf_addf(errbuf,
+						    _("could not remove '%s' before restore: %s; "),
+						    to.buf, strerror(errno));
+					ret = -1;
+					continue;
+				}
+			} else if (unlink(to.buf) < 0) {
+				strbuf_addf(errbuf,
+					    _("could not unlink '%s' before restore: %s; "),
+					    to.buf, strerror(errno));
+				ret = -1;
+				continue;
+			}
 		}
 
-		rename(from.buf, to.buf);
+		if (rename(from.buf, to.buf) < 0) {
+			strbuf_addf(errbuf,
+				    _("could not restore '%s' from '%s': %s; "),
+				    to.buf, from.buf, strerror(errno));
+			ret = -1;
+		}
 	}
 
 	/* Restore root refs from backup */
-	{
-		struct strbuf restore_err = STRBUF_INIT;
-		int restore_ret = move_root_refs(backup_dir, gitdir, 1, &restore_err);
-		if (restore_ret < 0) {
-			warning_errno(_("could not open directory '%s' to restore root refs"), backup_dir);
-		} else if (restore_ret > 0) {
-			warning(_("failed to restore some root refs: %s"), restore_err.buf);
-		}
-		strbuf_release(&restore_err);
+	root_ret = move_root_refs(backup_dir, gitdir, 1, &root_err);
+	if (root_ret < 0) {
+		strbuf_addf(errbuf,
+			    _("could not open directory '%s' to restore root refs: %s; "),
+			    backup_dir, strerror(errno));
+		ret = -1;
+	} else if (root_ret > 0) {
+		strbuf_addf(errbuf, _("failed to restore some root refs: %s"),
+			    root_err.buf);
+		ret = -1;
 	}
 
+	strbuf_release(&root_err);
 	strbuf_release(&from);
 	strbuf_release(&to);
+	return ret;
 }
 
 /*
@@ -3874,6 +3901,12 @@ int repo_migrate_ref_storage_format(struct repository *repo,
 		if (!mkdtemp(wt_data->backup_dir.buf)) {
 			strbuf_addf(errbuf, _("cannot create backup directory for worktree '%s': %s"),
 				    worktrees[i]->path, strerror(errno));
+			/*
+			 * mkdtemp leaves an unspecified template in buf on
+			 * failure. Clear it so the rollback loop below does
+			 * not try to restore from a nonexistent backup.
+			 */
+			strbuf_reset(&wt_data->backup_dir);
 			ret = -1;
 			goto done;
 		}
@@ -3934,16 +3967,34 @@ done:
 	if (ret) {
 		/*
 		 * Migration failed. Attempt to restore from backups if we made
-		 * it to Phase 2.
+		 * it to Phase 2. If a restore reports any destructive-step
+		 * failure, preserve the backup directory: it may hold the only
+		 * remaining copy of the worktree's refs.
 		 */
 		for (size_t i = 0; wt_migrations && i < nr_worktrees; i++) {
-			if (wt_migrations[i].backup_dir.len) {
-				restore_ref_storage_from_backup(
-					wt_migrations[i].old_refs->gitdir,
-					wt_migrations[i].backup_dir.buf,
-					wt_migrations[i].is_main);
+			struct strbuf restore_err = STRBUF_INIT;
+			int restore_ret;
+
+			if (!wt_migrations[i].backup_dir.len)
+				continue;
+
+			restore_ret = restore_ref_storage_from_backup(
+				wt_migrations[i].old_refs->gitdir,
+				wt_migrations[i].backup_dir.buf,
+				wt_migrations[i].is_main,
+				&restore_err);
+			if (restore_ret < 0) {
+				strbuf_complete(errbuf, '\n');
+				strbuf_addf(errbuf,
+					    _("failed to fully restore worktree '%s' from backup; "
+					      "backup preserved at '%s' for manual recovery: %s"),
+					    worktrees[i]->path,
+					    wt_migrations[i].backup_dir.buf,
+					    restore_err.buf);
+			} else {
 				delete_backup(wt_migrations[i].backup_dir.buf);
 			}
+			strbuf_release(&restore_err);
 		}
 
 		/*
