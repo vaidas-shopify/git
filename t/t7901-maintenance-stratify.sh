@@ -472,7 +472,29 @@ test_expect_success 'stratify-prune relabels orphan anchor packs to a surviving 
 		# Both sidecars now belong to the surviving anchor.
 		extract_sidecar_refs >actual &&
 		printf "refs/heads/master\nrefs/heads/master\n" >expect &&
-		test_cmp expect actual
+		test_cmp expect actual &&
+
+		# The orphan pack'\''s original anchor_commit (release tip r1)
+		# is not on master'\''s history — they are siblings of c1. To
+		# satisfy the next stratify validation pass, the relabel
+		# substitutes the merge-base (c1) as the new anchor_commit.
+		# The two sidecars therefore record c1 (relabeled) and c2
+		# (master'\''s own pack).
+		>anchors &&
+		for sidecar in .git/objects/pack/*.base-stratum
+		do
+			extract_sidecar_anchor "$sidecar" >>anchors || return 1
+		done &&
+		sort -u anchors >anchors.uniq &&
+		git rev-parse refs/heads/master^ refs/heads/master | sort -u >expect &&
+		test_cmp expect anchors.uniq &&
+
+		# A follow-up stratify validation pass must accept both
+		# sidecars: anchor_commit c1 is on master'\''s history, and
+		# anchor_commit c2 is master itself.
+		git maintenance run --task=stratify --no-quiet 2>err2 &&
+		! grep "not ancestor" err2 &&
+		test 2 -eq $(count_sidecars)
 	)
 '
 
@@ -574,6 +596,21 @@ test_expect_success 'shared-history anchors survive donor demotion and surface-g
 		printf "refs/heads/release\nrefs/heads/release\n" >expect &&
 		test_cmp expect actual &&
 
+		# master'\''s original anchor_commit (c2) is not on release'\''s
+		# history. The relabel must substitute the merge-base (c1)
+		# so the sidecar passes validation: every recorded
+		# anchor_commit must be an ancestor of the recorded
+		# anchor_ref'\''s tip.
+		>anchors &&
+		for sidecar in .git/objects/pack/*.base-stratum
+		do
+			extract_sidecar_anchor "$sidecar" >>anchors || return 1
+		done &&
+		sort -u anchors >anchors.uniq &&
+		git rev-parse refs/heads/release refs/heads/release^ |
+			sort -u >expect &&
+		test_cmp expect anchors.uniq &&
+
 		# surface-gc'\''s readiness check compares the stratify
 		# frontier against (now - min-age - grace-period); against
 		# the suite'\''s 1970-dated commits the default cutoff is
@@ -597,6 +634,72 @@ test_expect_success 'shared-history anchors survive donor demotion and surface-g
 		git cat-file -e $c1 &&
 		git fsck --strict
 	)
+'
+
+# Pick a relabel target per pack, not once per run keyed by config order.
+# With multiple surviving anchors of which only one is reachable from the
+# orphan'\''s anchor_commit, the per-pack target must be the compatible
+# one — regardless of which surviving anchor is listed first.
+test_expect_success 'stratify-prune target selection is independent of anchor config order' '
+	for order in main_first other_first
+	do
+		test_when_finished "rm -rf prune-order-$order" &&
+		test_create_repo prune-order-$order &&
+		(
+			cd prune-order-$order &&
+
+			# main: c1 → c2, shares c1 with feature.
+			# feature: c1 → f1 (sibling of c2 from c1).
+			# other: independent root, u1 → u2.
+			test_commit --no-tag c1 &&
+			git branch feature HEAD &&
+			git checkout -q --orphan other-root &&
+			git rm -rf . &&
+			test_commit --no-tag u1 &&
+			test_commit --no-tag u2 &&
+			git branch -M other &&
+			git checkout -q master &&
+			test_commit --no-tag c2 &&
+			git checkout -q feature &&
+			test_commit --no-tag f1 &&
+			git checkout -q master &&
+
+			git config --add maintenance.stratified.anchor refs/heads/master &&
+			git config --add maintenance.stratified.anchor refs/heads/feature &&
+			git config --add maintenance.stratified.anchor refs/heads/other &&
+			git maintenance run --task=stratify --quiet &&
+			test 3 -eq $(count_sidecars) &&
+
+			# Retire feature; keep master and other configured. Try
+			# both orders: only master shares any history with f1
+			# (via merge-base c1); other has an independent root and
+			# no common ancestor at all. Both orders must pick
+			# master.
+			git config --unset-all maintenance.stratified.anchor &&
+			case "$order" in
+			main_first)
+				git config --add maintenance.stratified.anchor refs/heads/master &&
+				git config --add maintenance.stratified.anchor refs/heads/other
+				;;
+			other_first)
+				git config --add maintenance.stratified.anchor refs/heads/other &&
+				git config --add maintenance.stratified.anchor refs/heads/master
+				;;
+			esac &&
+
+			git maintenance run --task=stratify-prune --no-quiet 2>err &&
+			test_grep "relabeled" err &&
+			test_grep "to surviving anchor .refs/heads/master." err &&
+			! test_grep "to surviving anchor .refs/heads/other." err &&
+
+			# A follow-up stratify validation pass must not demote
+			# the relabeled pack: its substituted anchor_commit must
+			# be on master'\''s history.
+			git maintenance run --task=stratify --no-quiet 2>err2 &&
+			! grep "not ancestor" err2 &&
+			test 3 -eq $(count_sidecars)
+		) || return 1
+	done
 '
 
 test_done

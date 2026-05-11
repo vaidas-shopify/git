@@ -191,9 +191,30 @@ them at expiration. To prevent this, `stratify-prune` *relabels* each
 orphan pack's `.base-stratum` sidecar to claim a surviving anchor as
 its `anchor_ref`. The pack stays kept, joins the survivor's group, and
 is later folded into the survivor's pack(s) by `consolidate-stratum`'s
-geometric merge. If no surviving anchor has any base-stratum pack of
-its own, no kept pack exists whose closure could be broken, so the
-orphan can simply be demoted (the historical behavior).
+geometric merge.
+
+The relabel target is chosen per orphan pack (not once per run): the
+recorded `anchor_commit` must be reachable from the chosen
+`anchor_ref`'s tip, because the next stratify validation pass demotes
+any pack whose `anchor_commit` is not an ancestor of its ref. Where
+the orphan's `anchor_commit` already lies on some surviving anchor's
+history, that commit is preserved verbatim. Where it does not, the
+sidecar is rewritten with the merge-base of the orphan's
+`anchor_commit` and the chosen surviving tip: the merge-base lies on
+both histories, and the orphan pack — which covers everything
+reachable from its original `anchor_commit` — necessarily covers the
+merge-base as well, so the new claim is true. The recorded frontier
+date drops to the merge-base's date, which is harmless: future
+stratify runs on the new anchor find their own packs' later
+`anchor_commits` via `find_stratified_ancestor` and use those as the
+rev-list bound instead.
+
+If no surviving anchor has any base-stratum pack of its own, no kept
+pack exists whose closure could be broken, so the orphan can simply be
+demoted (the historical behavior). Likewise, if no surviving anchor
+shares any history with the orphan's `anchor_commit` (no merge-base),
+demotion is safe: with no common ancestry there are no shared objects
+for surviving packs to be referencing via cross-anchor dedup.
 
 The same cross-anchor lookup powers `find_stratified_ancestor()`, which
 the per-anchor stratify loop uses to bound its rev-list (`^<bound>`):

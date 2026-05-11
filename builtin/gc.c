@@ -2858,13 +2858,104 @@ static int repo_has_base_stratum_packs(struct repository *r)
 	return 0;
 }
 
+/*
+ * Pick a relabel target for an orphan pack whose recorded anchor_commit
+ * is `orig_anchor_oid`. The sidecar we write must satisfy the next
+ * stratify validation pass, which requires anchor_commit to be an
+ * ancestor of anchor_ref's tip — otherwise the pack is demoted on the
+ * next run and the closed-set property breaks anyway. Two strategies,
+ * in preference order:
+ *
+ *   1. Preserve the orphan's anchor_commit if some surviving anchor's
+ *      tip already has it on history. The pack's frontier date is
+ *      unchanged, which is the cheapest outcome.
+ *
+ *   2. Otherwise substitute a merge-base of the orphan's anchor_commit
+ *      with a surviving anchor's tip. The merge-base lies on both
+ *      histories, and the orphan pack covers everything reachable from
+ *      its original anchor_commit (a descendant of the merge-base), so
+ *      the new claim "anchor_ref X covers anchor_commit Y" is true.
+ *      The recorded frontier date is earlier, which is harmless: future
+ *      stratify runs of the new anchor find their own packs' later
+ *      anchor_commits as the rev-list bound.
+ *
+ * Within each strategy we iterate `configured` in order so behavior is
+ * deterministic, but the choice no longer depends on whether the first
+ * configured anchor happens to be compatible — every configured anchor
+ * is considered.
+ *
+ * On success, writes the chosen ref into *out_anchor_ref (pointer into
+ * `configured`; do not free) and the chosen commit into
+ * *out_anchor_commit. Returns 0 on success, -1 if no surviving anchor
+ * is reachable from the orphan's anchor_commit (caller should demote).
+ */
+static int find_relabel_target(struct repository *r,
+			       const struct object_id *orig_anchor_oid,
+			       const struct string_list *configured,
+			       const char **out_anchor_ref,
+			       struct object_id *out_anchor_commit)
+{
+	struct commit *orig_anchor;
+	size_t i;
+
+	orig_anchor = lookup_commit(r, orig_anchor_oid);
+	if (!orig_anchor || repo_parse_commit(r, orig_anchor))
+		return -1;
+
+	for (i = 0; i < configured->nr; i++) {
+		const char *ref = configured->items[i].string;
+		struct object_id tip_oid;
+		struct commit *tip_commit;
+
+		if (!refs_resolve_ref_unsafe(get_main_ref_store(r), ref,
+					     RESOLVE_REF_READING, &tip_oid,
+					     NULL))
+			continue;
+		tip_commit = lookup_commit_reference_gently(r, &tip_oid, 1);
+		if (!tip_commit || repo_parse_commit(r, tip_commit))
+			continue;
+		if (repo_in_merge_bases(r, orig_anchor, tip_commit)) {
+			*out_anchor_ref = ref;
+			oidcpy(out_anchor_commit, orig_anchor_oid);
+			return 0;
+		}
+	}
+
+	for (i = 0; i < configured->nr; i++) {
+		const char *ref = configured->items[i].string;
+		struct object_id tip_oid;
+		struct commit *tip_commit;
+		struct commit_list *bases = NULL;
+
+		if (!refs_resolve_ref_unsafe(get_main_ref_store(r), ref,
+					     RESOLVE_REF_READING, &tip_oid,
+					     NULL))
+			continue;
+		tip_commit = lookup_commit_reference_gently(r, &tip_oid, 1);
+		if (!tip_commit || repo_parse_commit(r, tip_commit))
+			continue;
+		if (repo_get_merge_bases(r, orig_anchor, tip_commit, &bases)) {
+			free_commit_list(bases);
+			continue;
+		}
+		if (bases) {
+			*out_anchor_ref = ref;
+			oidcpy(out_anchor_commit, &bases->item->object.oid);
+			free_commit_list(bases);
+			return 0;
+		}
+	}
+
+	return -1;
+}
+
 static int maintenance_task_stratify_prune(struct maintenance_run_opts *opts,
 					   struct gc_config *cfg UNUSED)
 {
 	struct repository *r = the_repository;
 	struct string_list ref_groups = STRING_LIST_INIT_DUP;
 	struct string_list configured = STRING_LIST_INIT_DUP;
-	const char *target_anchor = NULL;
+	int any_survivor_has_pack = 0;
 	size_t i, j, demoted = 0, relabeled = 0;
 
 	if (load_unique_stratify_anchors(r, &configured)) {
@@ -2893,25 +2984,31 @@ static int maintenance_task_stratify_prune(struct maintenance_run_opts *opts,
 	collect_base_stratum_pack_groups(r, &ref_groups);
 
 	/*
-	 * Pick a relabel target: the first surviving anchor whose group
-	 * already has at least one base-stratum pack. Cross-anchor dedup
-	 * means an orphan pack may exclusively hold objects that surviving
-	 * packs reference as ancestors; dropping its .base-stratum/.keep
+	 * Relabel rather than demote when at least one surviving anchor
+	 * has a base-stratum pack of its own. Cross-anchor dedup means an
+	 * orphan pack may exclusively hold objects that surviving packs
+	 * reference as ancestors; dropping its .base-stratum/.keep
 	 * outright would break the closed-set property under
-	 * --kept-pack-boundary and surface-gc would later classify those
-	 * shared ancestors as cruft. Relabel the orphan's sidecar onto a
-	 * surviving anchor instead, so the pack stays kept and joins the
-	 * survivor's group; consolidate-stratum's geometric merge folds it
-	 * in over time.
+	 * --kept-pack-boundary, and surface-gc would later classify those
+	 * shared ancestors as cruft. Relabeling keeps the pack kept and
+	 * folds it into the survivor's group via consolidate-stratum's
+	 * geometric merge.
 	 *
-	 * If no surviving anchor has a pack of its own, no kept pack
-	 * exists whose closure could be broken, so the orphan can simply
-	 * be demoted (the historical behavior).
+	 * If no surviving anchor has a pack of its own, there is no kept
+	 * pack whose closure could be broken; orphans can simply be
+	 * demoted (the historical behavior).
+	 *
+	 * The per-pack target choice is made inside the loop below by
+	 * find_relabel_target(); it must be made per pack because the
+	 * orphan's anchor_commit has to be reachable from the target
+	 * anchor's tip (or substituted with a merge-base that is). A
+	 * single up-front choice keyed off config order would produce
+	 * sidecars the next stratify validation pass demotes.
 	 */
 	for (i = 0; i < ref_groups.nr; i++) {
 		if (unsorted_string_list_has_string(&configured,
 						    ref_groups.items[i].string)) {
-			target_anchor = ref_groups.items[i].string;
+			any_survivor_has_pack = 1;
 			break;
 		}
 	}
@@ -2926,10 +3023,15 @@ static int maintenance_task_stratify_prune(struct maintenance_run_opts *opts,
 		trace2_region_enter("stratify-prune", anchor, r);
 		for (j = 0; j < group->nr; j++) {
 			struct base_stratum_pack_entry *entry = &group->entries[j];
+			const char *target_anchor = NULL;
+			struct object_id target_commit;
 
-			if (target_anchor &&
+			if (any_survivor_has_pack &&
+			    !find_relabel_target(r, &entry->anchor_commit,
+						 &configured, &target_anchor,
+						 &target_commit) &&
 			    !write_pack_base_stratum(entry->pack,
-						     &entry->anchor_commit,
+						     &target_commit,
 						     target_anchor,
 						     entry->stratified_timestamp)) {
 				if (!opts->quiet)
