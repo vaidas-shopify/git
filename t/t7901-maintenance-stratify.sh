@@ -702,4 +702,114 @@ test_expect_success 'stratify-prune target selection is independent of anchor co
 	done
 '
 
+# Cross-anchor dedup operates at the OID level (find_pack_entry_one
+# lookups in filter_already_packed_oids), not by commit ancestry. Two
+# anchors on independent roots can therefore share tree/blob OIDs — the
+# empty tree, an identical LICENSE blob, etc. — and the later anchor'\''s
+# pack legitimately omits objects covered by the earlier one. Demoting
+# the earlier pack when its anchor is retired would break the closed
+# set the same way unlinking the .keep does in the shared-history case,
+# even though no merge-base exists. stratify-prune must instead borrow
+# a surviving anchor'\''s own recorded anchor_commit so the orphan stays
+# kept.
+test_expect_success 'no-merge-base orphan is relabeled, not demoted' '
+	test_create_repo no-merge-base-survive &&
+	(
+		cd no-merge-base-survive &&
+
+		# unrelated: orphan root with shared.txt only.
+		# master: own root with shared.txt + master.txt, then m1.
+		# The shared.txt blob has identical content in both
+		# histories, so its OID is identical too. master and
+		# unrelated have no common commit ancestor.
+		test_commit --no-tag master-root master.txt master &&
+		echo "shared content" >shared.txt &&
+		git add shared.txt &&
+		git -c user.email=t@t -c user.name=t commit -m "add shared" &&
+		test_commit --no-tag m1 m1.txt m1 &&
+
+		git checkout -q --orphan unrelated-root &&
+		git rm -rf . &&
+		echo "shared content" >shared.txt &&
+		git add shared.txt &&
+		git -c user.email=t@t -c user.name=t commit -m "unrelated: add shared" &&
+		git branch -M unrelated &&
+		git checkout -q master &&
+
+		# Sanity: master and unrelated really have no merge-base,
+		# and the shared.txt blob has the same OID in both.
+		test_must_fail git merge-base refs/heads/master \
+				refs/heads/unrelated &&
+		shared_blob=$(git rev-parse refs/heads/master:shared.txt) &&
+		test "$shared_blob" = \
+			$(git rev-parse refs/heads/unrelated:shared.txt) &&
+
+		# Stratify with unrelated FIRST so its pack absorbs the
+		# shared.txt blob; master is processed next and its pack
+		# filters that blob out via cross-anchor OID dedup.
+		git config --add maintenance.stratified.anchor refs/heads/unrelated &&
+		git config --add maintenance.stratified.anchor refs/heads/master &&
+		git maintenance run --task=stratify --quiet &&
+		test 2 -eq $(count_sidecars) &&
+
+		# Confirm master'\''s pack actually omits shared_blob (it
+		# now depends on unrelated'\''s pack via OID dedup).
+		master_pack=$(grep -l "refs/heads/master" \
+			.git/objects/pack/*.base-stratum |
+			sed "s/\\.base-stratum$/.idx/") &&
+		! git verify-pack -v "$master_pack" |
+			grep -q "^$shared_blob " &&
+
+		# Retire unrelated entirely: drop config AND delete the
+		# ref. The orphan pack'\''s anchor_commit has no merge-base
+		# with master'\''s tip, so the merge-base strategies fail
+		# and only the survivor-anchor borrow can preserve the
+		# closed set.
+		git config --unset-all maintenance.stratified.anchor refs/heads/unrelated &&
+		git update-ref -d refs/heads/unrelated &&
+		git reflog expire --expire=now --expire-unreachable=now --all &&
+
+		git maintenance run --task=stratify-prune --no-quiet 2>err &&
+		test_grep "relabeled" err &&
+		! test_grep "demoting" err &&
+
+		# Both sidecars now name refs/heads/master.
+		extract_sidecar_refs >actual &&
+		printf "refs/heads/master\nrefs/heads/master\n" >expect &&
+		test_cmp expect actual &&
+
+		# The borrowed anchor_commit must equal master'\''s own
+		# recorded anchor_commit so validation passes on the next
+		# stratify run.
+		>anchors &&
+		for sidecar in .git/objects/pack/*.base-stratum
+		do
+			extract_sidecar_anchor "$sidecar" >>anchors || return 1
+		done &&
+		sort -u anchors >anchors.uniq &&
+		test_line_count = 1 anchors.uniq &&
+
+		git maintenance run --task=stratify --no-quiet 2>err2 &&
+		! grep "not ancestor" err2 &&
+		test 2 -eq $(count_sidecars) &&
+
+		# surface-gc'\''s readiness check needs the frontier to
+		# clear (now - min-age - grace-period); the 1970-dated
+		# commits in the test suite always lag the default, so
+		# move the cutoff to the frontier.
+		git config maintenance.stratified.min-age "@1 +0000" &&
+		git config maintenance.stratified.grace-period now &&
+
+		# cruft-expiration=tomorrow forces anything classified as
+		# cruft in this run to be pruned immediately, so a missing
+		# relabel surfaces as a vanished shared_blob rather than a
+		# delayed pruning weeks later.
+		git -c maintenance.stratified.cruft-expiration=tomorrow \
+			maintenance run --task=surface-gc --quiet &&
+
+		git cat-file -e $shared_blob &&
+		git fsck --strict
+	)
+'
+
 test_done

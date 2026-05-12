@@ -2863,7 +2863,7 @@ static int repo_has_base_stratum_packs(struct repository *r)
  * is `orig_anchor_oid`. The sidecar we write must satisfy the next
  * stratify validation pass, which requires anchor_commit to be an
  * ancestor of anchor_ref's tip — otherwise the pack is demoted on the
- * next run and the closed-set property breaks anyway. Two strategies,
+ * next run and the closed-set property breaks anyway. Three strategies,
  * in preference order:
  *
  *   1. Preserve the orphan's anchor_commit if some surviving anchor's
@@ -2879,6 +2879,25 @@ static int repo_has_base_stratum_packs(struct repository *r)
  *      stratify runs of the new anchor find their own packs' later
  *      anchor_commits as the rev-list bound.
  *
+ *   3. Otherwise (no commit-graph relation between the orphan and any
+ *      surviving anchor) borrow a surviving anchor's *own* recorded
+ *      anchor_commit, taken from one of its existing base-stratum
+ *      packs. Cross-anchor dedup operates at the OID level — see
+ *      filter_already_packed_oids() — not by commit ancestry, so
+ *      independently-rooted anchors can still share tree/blob OIDs
+ *      (the empty tree, an identical LICENSE / .gitignore blob, a
+ *      `.gitkeep`, etc.) and the orphan pack may exclusively hold
+ *      objects a surviving pack now references after that dedup.
+ *      Demoting in this case unlinks the orphan's .keep and drops the
+ *      closed-set guarantee that --kept-pack-boundary relies on, so
+ *      surface-gc's walk would skip those shared objects on a
+ *      subsequent run and the cruft repack would prune them. The
+ *      borrowed anchor_commit is, by construction, an ancestor of the
+ *      chosen anchor_ref's tip (the survivor's own pack was just
+ *      validated against it), and no newer than any other survivor
+ *      anchor_commit, so it cannot push find_stratified_ancestor past
+ *      the survivor's true frontier.
+ *
  * Within each strategy we iterate `configured` in order so behavior is
  * deterministic, but the choice no longer depends on whether the first
  * configured anchor happens to be compatible — every configured anchor
@@ -2886,12 +2905,15 @@ static int repo_has_base_stratum_packs(struct repository *r)
  *
  * On success, writes the chosen ref into *out_anchor_ref (pointer into
  * `configured`; do not free) and the chosen commit into
- * *out_anchor_commit. Returns 0 on success, -1 if no surviving anchor
- * is reachable from the orphan's anchor_commit (caller should demote).
+ * *out_anchor_commit. Returns 0 on success, -1 only when no surviving
+ * anchor has a base-stratum pack of its own — at which point there is
+ * no kept set whose closure could be broken, and the caller can safely
+ * demote.
  */
 static int find_relabel_target(struct repository *r,
 			       const struct object_id *orig_anchor_oid,
 			       const struct string_list *configured,
+			       const struct string_list *ref_groups,
 			       const char **out_anchor_ref,
 			       struct object_id *out_anchor_commit)
 {
@@ -2946,6 +2968,25 @@ static int find_relabel_target(struct repository *r,
 		}
 	}
 
+	for (i = 0; i < configured->nr; i++) {
+		const char *ref = configured->items[i].string;
+		size_t k;
+
+		for (k = 0; k < ref_groups->nr; k++) {
+			struct base_stratum_pack_group *group;
+
+			if (strcmp(ref_groups->items[k].string, ref))
+				continue;
+			group = ref_groups->items[k].util;
+			if (!group || !group->nr)
+				break;
+			*out_anchor_ref = ref;
+			oidcpy(out_anchor_commit,
+			       &group->entries[0].anchor_commit);
+			return 0;
+		}
+	}
+
 	return -1;
 }
 
@@ -2955,7 +2996,6 @@ static int maintenance_task_stratify_prune(struct maintenance_run_opts *opts,
 	struct repository *r = the_repository;
 	struct string_list ref_groups = STRING_LIST_INIT_DUP;
 	struct string_list configured = STRING_LIST_INIT_DUP;
-	int any_survivor_has_pack = 0;
 	size_t i, j, demoted = 0, relabeled = 0;
 
 	if (load_unique_stratify_anchors(r, &configured)) {
@@ -2987,32 +3027,19 @@ static int maintenance_task_stratify_prune(struct maintenance_run_opts *opts,
 	 * Relabel rather than demote when at least one surviving anchor
 	 * has a base-stratum pack of its own. Cross-anchor dedup means an
 	 * orphan pack may exclusively hold objects that surviving packs
-	 * reference as ancestors; dropping its .base-stratum/.keep
-	 * outright would break the closed-set property under
-	 * --kept-pack-boundary, and surface-gc would later classify those
-	 * shared ancestors as cruft. Relabeling keeps the pack kept and
-	 * folds it into the survivor's group via consolidate-stratum's
-	 * geometric merge.
+	 * reference; dropping its .base-stratum/.keep outright would
+	 * break the closed-set property under --kept-pack-boundary, and
+	 * surface-gc would later classify those shared objects as cruft.
+	 * Relabeling keeps the pack kept and folds it into the survivor's
+	 * group via consolidate-stratum's geometric merge.
 	 *
-	 * If no surviving anchor has a pack of its own, there is no kept
-	 * pack whose closure could be broken; orphans can simply be
-	 * demoted (the historical behavior).
-	 *
-	 * The per-pack target choice is made inside the loop below by
-	 * find_relabel_target(); it must be made per pack because the
-	 * orphan's anchor_commit has to be reachable from the target
-	 * anchor's tip (or substituted with a merge-base that is). A
-	 * single up-front choice keyed off config order would produce
-	 * sidecars the next stratify validation pass demotes.
+	 * The per-pack target choice is made by find_relabel_target(),
+	 * which considers every configured anchor in three strategies
+	 * (preserve, merge-base substitute, survivor-anchor borrow) and
+	 * returns -1 only when no surviving anchor has a pack of its own
+	 * — at which point there is no kept set whose closure could be
+	 * broken and demotion is safe.
 	 */
-	for (i = 0; i < ref_groups.nr; i++) {
-		if (unsorted_string_list_has_string(&configured,
-						    ref_groups.items[i].string)) {
-			any_survivor_has_pack = 1;
-			break;
-		}
-	}
-
 	for (i = 0; i < ref_groups.nr; i++) {
 		struct base_stratum_pack_group *group = ref_groups.items[i].util;
 		const char *anchor = ref_groups.items[i].string;
@@ -3026,9 +3053,9 @@ static int maintenance_task_stratify_prune(struct maintenance_run_opts *opts,
 			const char *target_anchor = NULL;
 			struct object_id target_commit;
 
-			if (any_survivor_has_pack &&
-			    !find_relabel_target(r, &entry->anchor_commit,
-						 &configured, &target_anchor,
+			if (!find_relabel_target(r, &entry->anchor_commit,
+						 &configured, &ref_groups,
+						 &target_anchor,
 						 &target_commit) &&
 			    !write_pack_base_stratum(entry->pack,
 						     &target_commit,
