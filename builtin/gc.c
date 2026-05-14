@@ -2870,6 +2870,39 @@ static int repo_has_base_stratum_packs(struct repository *r)
 }
 
 /*
+ * From a group of base-stratum packs that all share an anchor_ref (and
+ * have therefore all been validated as ancestors of that ref's tip),
+ * pick the entry whose anchor_commit has the smallest committer date.
+ * Entries are appended to the group in repo_for_each_pack iteration
+ * order, not by ancestry, so we cannot rely on entries[0]. Returns 0 on
+ * success and writes the chosen OID into *out; returns -1 if no entry's
+ * anchor_commit can be parsed.
+ */
+static int pick_oldest_anchor_commit(struct repository *r,
+				     const struct base_stratum_pack_group *group,
+				     struct object_id *out)
+{
+	timestamp_t best_date = TIME_MAX;
+	int found = 0;
+	size_t j;
+
+	for (j = 0; j < group->nr; j++) {
+		const struct base_stratum_pack_entry *e = &group->entries[j];
+		struct commit *c = lookup_commit(r, &e->anchor_commit);
+
+		if (!c || repo_parse_commit(r, c))
+			continue;
+		if (!found || c->date < best_date) {
+			oidcpy(out, &e->anchor_commit);
+			best_date = c->date;
+			found = 1;
+		}
+	}
+
+	return found ? 0 : -1;
+}
+
+/*
  * Pick a relabel target for an orphan pack whose recorded anchor_commit
  * is `orig_anchor_oid`. The sidecar we write must satisfy the next
  * stratify validation pass, which requires anchor_commit to be an
@@ -2892,8 +2925,9 @@ static int repo_has_base_stratum_packs(struct repository *r)
  *
  *   3. Otherwise (no commit-graph relation between the orphan and any
  *      surviving anchor) borrow a surviving anchor's *own* recorded
- *      anchor_commit, taken from one of its existing base-stratum
- *      packs. Cross-anchor dedup operates at the OID level — see
+ *      anchor_commit, taken from the oldest (by committer date) of its
+ *      existing base-stratum packs. Cross-anchor dedup operates at the
+ *      OID level — see
  *      filter_already_packed_oids() — not by commit ancestry, so
  *      independently-rooted anchors can still share tree/blob OIDs
  *      (the empty tree, an identical LICENSE / .gitignore blob, a
@@ -2989,15 +3023,17 @@ static int find_relabel_target(struct repository *r,
 
 		for (k = 0; k < ref_groups->nr; k++) {
 			struct base_stratum_pack_group *group;
+			struct object_id oldest;
 
 			if (strcmp(ref_groups->items[k].string, ref))
 				continue;
 			group = ref_groups->items[k].util;
 			if (!group || !group->nr)
 				break;
+			if (pick_oldest_anchor_commit(r, group, &oldest))
+				break;
 			*out_anchor_ref = ref;
-			oidcpy(out_anchor_commit,
-			       &group->entries[0].anchor_commit);
+			oidcpy(out_anchor_commit, &oldest);
 			return 0;
 		}
 	}

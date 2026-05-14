@@ -812,4 +812,106 @@ test_expect_success 'no-merge-base orphan is relabeled, not demoted' '
 	)
 '
 
+# Strategy 3 (survivor-anchor borrow) must pick the survivor pack
+# whose anchor_commit is the *oldest* by committer date, not the
+# first entry in repo_for_each_pack iteration order. The pack list
+# is sorted mtime-descending, so entries[0] is the newest pack — its
+# anchor_commit is the survivor'\''s most-advanced frontier. Borrowing
+# that would overstate the survivor'\''s real coverage: on the next
+# stratify run, find_stratified_ancestor uses the borrowed commit as
+# ^bound and skips objects the survivor actually covers between the
+# older and newer anchor_commits, silently weakening the kept set.
+test_expect_success 'no-merge-base relabel borrows the oldest survivor anchor_commit' '
+	test_create_repo no-merge-base-oldest &&
+	(
+		cd no-merge-base-oldest &&
+
+		# master: c1 (root) -> c2 -> c3 with distinct committer
+		# dates so pick_oldest_anchor_commit can tell the two
+		# eventual master packs apart by ->date.
+		test_commit --no-tag --date "@100 +0000" c1 m1.txt m1 &&
+		c1_oid=$(git rev-parse HEAD) &&
+		test_commit --no-tag --date "@200 +0000" c2 m2.txt m2 &&
+		test_commit --no-tag --date "@300 +0000" c3 m3.txt m3 &&
+		c3_oid=$(git rev-parse HEAD) &&
+
+		# unrelated: own root, so no merge-base with master.
+		git checkout -q --orphan unrelated-root &&
+		git rm -rf . &&
+		test_commit --no-tag --date "@50 +0000" u1 u1.txt u1 &&
+		git branch -M unrelated &&
+		git checkout -q master &&
+
+		test_must_fail git merge-base refs/heads/master \
+				refs/heads/unrelated &&
+
+		git config --add maintenance.stratified.anchor refs/heads/master &&
+		git config --add maintenance.stratified.anchor refs/heads/unrelated &&
+
+		# Run 1, batch-size=4: each anchor gets its own budget.
+		# master admits c1 (commit+tree+blob = 3 objects) and
+		# trips on c2'\''s commit line (the 4th); the resulting
+		# pack records the last fully-included commit as the
+		# anchor, so master pack A has anchor_commit=c1.
+		# unrelated has only 3 objects and is fully covered.
+		git config maintenance.stratified.batch-size 4 &&
+		git maintenance run --task=stratify --quiet &&
+		test 2 -eq $(count_sidecars) &&
+
+		master_pack_a=$(grep -l "refs/heads/master" \
+			.git/objects/pack/*.base-stratum) &&
+		extract_sidecar_anchor "$master_pack_a" >a_anchor &&
+		echo "$c1_oid" >expect_a &&
+		test_cmp expect_a a_anchor &&
+
+		# Run 2, no batch limit: master walks from frontier c1
+		# through c2 and c3, producing master pack B with
+		# anchor_commit=c3.
+		git config --unset maintenance.stratified.batch-size &&
+		git maintenance run --task=stratify --quiet &&
+		test 3 -eq $(count_sidecars) &&
+
+		master_pack_b=$(grep -l "refs/heads/master" \
+			.git/objects/pack/*.base-stratum |
+			grep -v "^$master_pack_a$") &&
+		extract_sidecar_anchor "$master_pack_b" >b_anchor &&
+		echo "$c3_oid" >expect_b &&
+		test_cmp expect_b b_anchor &&
+
+		# Force a clear mtime gap: master pack B (the newer
+		# anchor_commit) gets the LATER mtime so under
+		# packfile_store_prepare'\''s mtime-descending sort it
+		# lands at entries[0] for master'\''s group. Without this,
+		# filesystem mtime resolution could let both packs tie
+		# and the directory-walk order would decide entries[0]
+		# arbitrarily.
+		test-tool chmtime =1000 \
+			"${master_pack_a%.base-stratum}.pack" &&
+		test-tool chmtime =2000 \
+			"${master_pack_b%.base-stratum}.pack" &&
+
+		# Record the orphan sidecar path now: write_pack_base_stratum
+		# rewrites in place under the pack'\''s existing filename,
+		# so the relabeled sidecar lives at this same path.
+		orphan_pack=$(grep -l "refs/heads/unrelated" \
+			.git/objects/pack/*.base-stratum) &&
+
+		git config --unset-all maintenance.stratified.anchor refs/heads/unrelated &&
+		git update-ref -d refs/heads/unrelated &&
+		git reflog expire --expire=now --expire-unreachable=now --all &&
+
+		git maintenance run --task=stratify-prune --no-quiet 2>err &&
+		test_grep "relabeled" err &&
+		! test_grep "demoting" err &&
+
+		# Strategy 3 must have borrowed master pack A'\''s
+		# anchor_commit (c1, the oldest in master'\''s group), not
+		# master pack B'\''s (c3, what a naive entries[0] reference
+		# would pick under mtime-descending order).
+		extract_sidecar_anchor "$orphan_pack" >borrowed &&
+		echo "$c1_oid" >expect_borrowed &&
+		test_cmp expect_borrowed borrowed
+	)
+'
+
 test_done
