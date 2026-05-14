@@ -1921,9 +1921,11 @@ static struct object_id *find_stratified_ancestor(struct repository *r,
 		 * Only consider anchors that lie on tip_oid's first-parent
 		 * ancestry — using a non-ancestor as ^bound would over-
 		 * exclude (descendants of tip_oid drag too much along)
-		 * or have no effect (unrelated commits).
+		 * or have no effect (unrelated commits). repo_in_merge_bases
+		 * can also return -1 on walk failure; treat that like a
+		 * non-ancestor and skip.
 		 */
-		if (!repo_in_merge_bases(r, anchor_commit, tip_commit)) {
+		if (repo_in_merge_bases(r, anchor_commit, tip_commit) <= 0) {
 			clear_base_stratum_data(&adata);
 			continue;
 		}
@@ -1978,6 +1980,7 @@ static timestamp_t stratified_frontier_date(struct repository *r,
 		struct base_stratum_data adata = { 0 };
 		struct commit *anchor_commit;
 		timestamp_t cand;
+		int anc, desc;
 
 		if (!p->in_base_stratum)
 			continue;
@@ -1990,16 +1993,24 @@ static timestamp_t stratified_frontier_date(struct repository *r,
 			continue;
 		}
 
-		if (repo_in_merge_bases(r, anchor_commit, tip_commit)) {
-			/* anchor_commit is ancestor of tip_oid */
-			cand = anchor_commit->date;
-		} else if (repo_in_merge_bases(r, tip_commit, anchor_commit)) {
-			/* anchor_commit is descendant: full coverage of tip */
-			cand = tip_commit->date;
-		} else {
-			/* unrelated histories */
+		anc = repo_in_merge_bases(r, anchor_commit, tip_commit);
+		if (anc < 0) {
 			clear_base_stratum_data(&adata);
 			continue;
+		}
+		if (anc) {
+			/* anchor_commit is ancestor of tip_oid */
+			cand = anchor_commit->date;
+		} else {
+			desc = repo_in_merge_bases(r, tip_commit,
+						   anchor_commit);
+			if (desc <= 0) {
+				/* error or unrelated histories */
+				clear_base_stratum_data(&adata);
+				continue;
+			}
+			/* descendant: full coverage of tip */
+			cand = tip_commit->date;
 		}
 
 		if (cand > best)
@@ -2928,6 +2939,7 @@ static int find_relabel_target(struct repository *r,
 		const char *ref = configured->items[i].string;
 		struct object_id tip_oid;
 		struct commit *tip_commit;
+		int anc;
 
 		if (!refs_resolve_ref_unsafe(get_main_ref_store(r), ref,
 					     RESOLVE_REF_READING, &tip_oid,
@@ -2936,7 +2948,10 @@ static int find_relabel_target(struct repository *r,
 		tip_commit = lookup_commit_reference_gently(r, &tip_oid, 1);
 		if (!tip_commit || repo_parse_commit(r, tip_commit))
 			continue;
-		if (repo_in_merge_bases(r, orig_anchor, tip_commit)) {
+		anc = repo_in_merge_bases(r, orig_anchor, tip_commit);
+		if (anc < 0)
+			continue;
+		if (anc) {
 			*out_anchor_ref = ref;
 			oidcpy(out_anchor_commit, orig_anchor_oid);
 			return 0;
