@@ -220,6 +220,7 @@ static int ignore_packed_keep_on_disk;
 static int ignore_packed_keep_in_core;
 static int ignore_packed_keep_in_core_open;
 static int ignore_packed_keep_in_core_has_cruft;
+static int kept_pack_boundary;
 static int allow_ofs_delta;
 static struct pack_idx_option pack_idx_opts;
 static const char *base_name;
@@ -3757,11 +3758,17 @@ static int git_pack_config(const char *k, const char *v,
 static int stdin_packs_found_nr;
 static int stdin_packs_hints_nr;
 
+struct stdin_pack_cb_data {
+	struct rev_info *revs;
+	int eager_pending;
+};
+
 static int add_object_entry_from_pack(const struct object_id *oid,
 				      struct packed_git *p,
 				      uint32_t pos,
 				      void *_data)
 {
+	struct stdin_pack_cb_data *data = _data;
 	off_t ofs;
 	struct object_info oi = OBJECT_INFO_INIT;
 	enum object_type type = OBJ_NONE;
@@ -3779,25 +3786,30 @@ static int add_object_entry_from_pack(const struct object_id *oid,
 	if (packed_object_info(p, ofs, &oi) < 0) {
 		die(_("could not get type of object %s in pack %s"),
 		    oid_to_hex(oid), p->pack_name);
-	} else if (type == OBJ_COMMIT) {
-		struct rev_info *revs = _data;
+	} else if (type == OBJ_COMMIT && data->eager_pending) {
 		/*
-		 * commits in included packs are used as starting points
-		 * for the subsequent revision walk
-		 *
-		 * Note that we do want to walk through commits that are
-		 * present in excluded-open ('!') packs to pick up any
-		 * objects reachable from them not present in the
-		 * excluded-closed ('^') packs.
-		 *
-		 * However, we'll only add those objects to the packing
-		 * list after checking `want_object_in_pack()` below.
+		 * Commits in excluded-open ('!') packs must be added as
+		 * revision walk starting points before the want check,
+		 * since want_object_in_pack() will reject them. We need
+		 * them as tips to discover objects reachable from these
+		 * packs that are not present in excluded-closed ('^')
+		 * packs.
 		 */
-		add_pending_oid(revs, NULL, oid, 0);
+		add_pending_oid(data->revs, NULL, oid, 0);
 	}
 
 	if (!want_object_in_pack(oid, 0, &p, &ofs))
 		return 0;
+
+	if (type == OBJ_COMMIT && !data->eager_pending) {
+		/*
+		 * Commits in included packs are used as starting points
+		 * for the subsequent revision walk. Only add them after
+		 * the want check to avoid walking history reachable from
+		 * commits that also exist in excluded packs.
+		 */
+		add_pending_oid(data->revs, NULL, oid, 0);
+	}
 
 	create_object_entry(oid, type, 0, 0, 0, p, ofs);
 
@@ -3944,11 +3956,17 @@ static void stdin_packs_add_pack_entries(struct strmap *packs,
 		}
 
 		if ((info->kind & STDIN_PACK_INCLUDE) ||
-		    (info->kind & STDIN_PACK_EXCLUDE_OPEN))
+		    (info->kind & STDIN_PACK_EXCLUDE_OPEN)) {
+			struct stdin_pack_cb_data data = {
+				.revs = revs,
+				.eager_pending =
+					!!(info->kind & STDIN_PACK_EXCLUDE_OPEN),
+			};
 			for_each_object_in_pack(info->p,
 						add_object_entry_from_pack,
-						revs,
+						&data,
 						ODB_FOR_EACH_OBJECT_PACK_ORDER);
+		}
 	}
 
 	string_list_clear(&keys, 0);
@@ -4793,6 +4811,12 @@ static void get_object_list(struct rev_info *revs, struct strvec *argv)
 	save_commit_buffer = 0;
 	setup_revisions_from_strvec(argv, revs, &s_r_opt);
 
+	if (kept_pack_boundary) {
+		revs->kept_pack_boundary = 1;
+		revs->no_kept_objects = 1;
+		revs->keep_pack_cache_flags |= KEPT_PACK_IN_CORE;
+	}
+
 	/* make sure shallows are read */
 	is_repository_shallow(the_repository);
 
@@ -5084,6 +5108,9 @@ int cmd_pack_objects(int argc,
 			 N_("ignore packs that have companion .keep file")),
 		OPT_STRING_LIST(0, "keep-pack", &keep_pack_list, N_("name"),
 				N_("ignore this pack")),
+		OPT_BOOL_F(0, "kept-pack-boundary", &kept_pack_boundary,
+			   N_("treat kept packs as traversal boundary"),
+			   PARSE_OPT_HIDDEN),
 		OPT_INTEGER(0, "compression", &pack_compression_level,
 			    N_("pack compression level")),
 		OPT_BOOL(0, "keep-true-parents", &grafts_keep_true_parents,

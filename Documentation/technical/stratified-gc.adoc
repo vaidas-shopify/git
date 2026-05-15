@@ -1,0 +1,417 @@
+Stratified Garbage Collection with Base-Stratum Packs
+=====================================================
+
+Overview
+--------
+
+Traditional Git garbage collection walks all objects in the repository to
+determine reachability, then repacks everything. This cost scales with the
+total repository size and becomes prohibitive for large repositories.
+
+Stratified GC takes a different approach: stratify objects that are known
+to be reachable into long-lived base-stratum packs, then scope garbage
+collection to only the unstratified remainder (the active stratum). This
+bounds GC cost to the size of the active stratum, not the total repository.
+
+....
+  Traditional GC:
+    Walk ALL objects -> classify -> repack everything
+    Cost: O(total repository)
+
+  Stratified GC:
+    Stratify objects reachable from stable refs -> base-stratum pack
+    GC walks only unstratified objects -> classify -> repack remainder
+    Cost: O(unstratified objects)  <<  O(total repository)
+....
+
+
+Object classification
+---------------------
+
+Objects in a repository are classified into three tiers:
+
+Tier 1: Base-stratum packs (base stratum)::
+	Objects reachable from configured anchor refs, identified by an
+	`.base-stratum` sidecar file. GC treats these as reachable without
+	walking into them.
+
+Tier 2: Regular packs (active stratum)::
+	Objects not yet stratified: recent commits, feature branches, fetched
+	objects. Managed by geometric repack and subject to surface-gc
+	reachability walks.
+
+Tier 3: Cruft packs (unreachable, awaiting expiration)::
+	Objects proven unreachable during surface GC. Same `.mtimes` mechanism
+	as today. Expired by cruft expiration.
+
+
+Base-stratum packs
+------------------
+
+A base-stratum pack is a standard packfile accompanied by a `.base-stratum`
+sidecar file that records the reachability proof.
+
+Anchor refs are user-configured refs that represent stable, long-lived
+history:
+
+----
+maintenance.stratified.anchor = refs/heads/main
+maintenance.stratified.anchor = refs/heads/release/v1
+----
+
+Only objects reachable from commits older than `maintenance.stratified.min-age`
+(default: `2.weeks.ago`) are stratified. This avoids stratifying objects from recent
+commits that might still be rewritten.
+
+.base-stratum file format
+~~~~~~~~~~~~~~~~~~~~~
+
+The `.base-stratum` file uses the following binary format (version 1):
+
+....
+Bytes 0-3:    signature (0x53545241 = "STRA", network byte order)
+Bytes 4-7:    version (1, network byte order)
+Bytes 8-11:   hash_id (1=SHA1, 2=SHA256, network byte order)
+Next N bytes: anchor_commit OID (raw, 20 or 32 bytes)
+Next 4 bytes: stratified_timestamp (network byte order)
+Next:         anchor_ref name (NUL-terminated string)
+Next N bytes: trailing checksum of all preceding data
+....
+
+The anchor commit and ref are recorded so the pack's reachability guarantee
+can be validated: if the anchor ref no longer points to a descendant of the
+anchor commit, the pack must be demoted back to a regular pack.
+
+Detection
+~~~~~~~~~
+
+Pack discovery checks for the `.base-stratum` sidecar the same way it checks for
+`.mtimes` to set `is_cruft`. The `packed_git` struct carries an `in_base_stratum`
+bit flag.
+
+Base-stratum packs are included in the multi-pack-index like any other pack.
+No MIDX format changes are needed.
+
+
+The stratify maintenance task
+-------------------------------
+
+The `stratify` task incrementally stratifies objects from regular packs into
+base-stratum packs. For each configured anchor ref, the task:
+
+1. Resolves the ref to a commit.
+2. Finds the last-stratified commit from existing `.base-stratum` files for that ref.
+3. Runs `git rev-list --objects --reverse --before=<min-age> <tip> [^<last_stratified>]`
+   to enumerate unstratified reachable objects.
+4. Feeds the object list to `git pack-objects` to create a new base-stratum pack.
+5. Writes the `.base-stratum` sidecar, recording the last commit in the output
+   as the anchor commit (not the ref tip).
+
+The incremental walk bounded by `^<last_stratified>` means subsequent runs only
+process objects newer than what was previously stratified. The walk cost is
+proportional to the new objects, not the entire history.
+
+Batch size control
+~~~~~~~~~~~~~~~~~~
+
+The `maintenance.stratified.batch-size` option (default: 0, unlimited) limits
+the number of objects stratified per anchor ref per run. With `--reverse`, oldest
+objects come first, so truncation stratifies the oldest batch and defers newer
+objects to subsequent runs.
+
+The `.base-stratum` sidecar records the last commit actually included in the
+batch (not the ref tip), so the next run's `^<last_stratified>` exclusion
+correctly continues from where the previous batch ended.
+
+This is important for the sliding time window: even without batch truncation,
+the anchor commit is always the last commit from the `--before=<min-age>`
+bounded output. As time passes and the min-age window advances, newly
+eligible commits appear between the recorded frontier and the new cutoff,
+and are picked up on the next run.
+
+Validation
+~~~~~~~~~~
+
+Before creating new base-stratum packs, the task validates existing ones.
+For each base-stratum pack:
+
+1. Load `.base-stratum` to get `anchor_ref` and `anchor_commit`.
+2. Resolve the anchor ref. If deleted, demote the pack.
+3. Check if `anchor_commit` is an ancestor of the current ref tip.
+   If not (history was rewritten), demote the pack.
+
+Demotion means deleting the `.base-stratum` file. The pack becomes a regular
+pack and is handled by geometric repack on the next run.
+
+Independent validation
+^^^^^^^^^^^^^^^^^^^^^^
+
+Each base-stratum pack in an anchor ref's group is validated
+independently against the current ref tip. If a pack's recorded
+`anchor_commit` is no longer an ancestor of the ref (force-push, ref
+deletion), the pack's `.base-stratum` and `.keep` sidecars are removed.
+The `.pack` and `.idx` files stay on disk and are absorbed by the next
+geometric repack on its normal cadence; cascade-by-timestamp ordering is
+not used (it relied on a fragile assumption that
+`stratified_timestamp` order matches commit-graph order, which clock
+skew, manual sidecar edits, or future timestamp-inheriting code paths
+can break).
+
+After demotion, the stratify task re-stratifies from scratch on the next
+run. The cross-anchor coverage lookup (see below) ensures any prefix of
+the ref's history that's still pinned by some other anchor's pack is
+not re-walked.
+
+This is cheap: one ancestor check per base-stratum pack via
+`repo_in_merge_bases()`, accelerated to near-constant time by the
+commit graph.
+
+Cross-anchor coverage and the closed-set property
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+When two anchors share history (a release branch that branched from
+main, a tag pointing at an old main commit, etc.) the shared objects
+are stratified once into whichever pack lands first; later packs in the
+same run, and packs created by subsequent runs, filter against the
+union of *all* base-stratum packs and only carry their own
+unique-to-anchor deltas.
+
+The closed-set property therefore holds at the *repository* level — the
+union of all base-stratum packs is closed under reachability from any
+configured anchor — rather than per anchor. Maintaining the *union* as
+the closed set across an anchor retirement is the responsibility of
+`stratify-prune`: when an anchor is dropped from configuration, its
+packs may exclusively hold objects that other anchors' packs reference
+as ancestors. Unlinking the orphan's `.base-stratum` and `.keep`
+outright would make those shared ancestors invisible to surface-gc's
+`--kept-pack-boundary` walk, which stops at surviving kept packs and
+would never reach into a now-regular orphan pack. The next cruft
+repack would then misclassify the shared ancestors as cruft and prune
+them at expiration. To prevent this, `stratify-prune` *relabels* each
+orphan pack's `.base-stratum` sidecar to claim a surviving anchor as
+its `anchor_ref`. The pack stays kept, joins the survivor's group, and
+is later folded into the survivor's pack(s) by `consolidate-stratum`'s
+geometric merge.
+
+The relabel target is chosen per orphan pack (not once per run): the
+recorded `anchor_commit` must be reachable from the chosen
+`anchor_ref`'s tip, because the next stratify validation pass demotes
+any pack whose `anchor_commit` is not an ancestor of its ref. Three
+strategies are tried in order:
+
+  1. Where the orphan's `anchor_commit` already lies on some surviving
+     anchor's history, that commit is preserved verbatim. The frontier
+     date is unchanged and the relabel is a no-op for validation.
+
+  2. Where it does not but the orphan shares some commit history with
+     a surviving anchor, the sidecar is rewritten with the merge-base
+     of the orphan's `anchor_commit` and the chosen surviving tip: the
+     merge-base lies on both histories, and the orphan pack — which
+     covers everything reachable from its original `anchor_commit` —
+     necessarily covers the merge-base as well, so the new claim is
+     true. The recorded frontier date drops to the merge-base's date,
+     which is harmless: future stratify runs on the new anchor find
+     their own packs' later `anchor_commits` via
+     `find_stratified_ancestor` and use those as the rev-list bound
+     instead.
+
+  3. Where the orphan and the survivors share no commit history at
+     all (no merge-base — independently-rooted anchors, an orphan
+     branch, a docs/gh-pages branch, a vendored subtree with its own
+     root), the sidecar borrows a surviving anchor's own
+     `anchor_commit` from one of its existing base-stratum packs. The
+     cross-anchor filter (`filter_already_packed_oids()`) operates at
+     the OID level, not by commit ancestry: any tree or blob with a
+     colliding hash — the empty tree, an identical
+     LICENSE/.gitignore/lockfile blob, a `.gitkeep`, and so on — is
+     deduplicated even across unrelated histories, so the orphan's
+     pack may exclusively hold objects a surviving pack now references
+     after that dedup. Borrowing the survivor's own `anchor_commit`
+     keeps validation passing (it is by definition an ancestor of the
+     survivor's tip) without poisoning `find_stratified_ancestor`'s
+     frontier (the survivor's own packs record the same commit).
+
+Only when no surviving anchor has any base-stratum pack of its own is
+demotion taken: in that case there is no kept set whose closure could
+be broken, and the orphan's objects are reachable from its still-live
+ref (or already unreachable, in which case normal GC handles them
+correctly).
+
+The same cross-anchor lookup powers `find_stratified_ancestor()`, which
+the per-anchor stratify loop uses to bound its rev-list (`^<bound>`):
+if some other configured anchor's pack already covers a prefix of this
+anchor's history, walking that prefix again is wasted work.
+
+
+The surface-gc maintenance task
+------------------------------
+
+The `surface-gc` task performs lightweight garbage collection scoped to the
+active stratum:
+
+1. Collects all base-stratum packs and passes them as `--keep-pack` with
+   `--kept-pack-boundary` to `git repack`. The reachability walk treats
+   kept packs as traversal boundaries: when the walk hits a commit, tree,
+   or blob in a kept pack, it stops traversing — it does not process
+   parents or recurse into trees. This is safe because of the closed-set
+   property (see below).
+2. Runs `git repack -d -l --cruft --cruft-expiration=<expiration>` on the
+   remaining (unstratified) objects.
+3. Reachable unstratified objects are repacked into a new regular pack.
+   Unreachable objects go into a cruft pack. Expired unreachable objects
+   are dropped.
+
+Readiness check
+~~~~~~~~~~~~~~~
+
+Before running, surface-gc verifies that stratify stratifying has caught up
+sufficiently. For each configured anchor ref, the commit date of the
+last-stratified commit must be newer than the combined threshold of
+`maintenance.stratified.min-age` plus `maintenance.stratified.grace-period`
+(default: `1.week.ago`).
+
+If any anchor's stratifying frontier is older than this cutoff, surface-gc is
+skipped. The active stratum would still be too large for surface-gc to
+save meaningful work over a full repack. This is particularly relevant
+when `batch-size` is set and stratify needs multiple runs to fully pin
+an anchor's history.
+
+Why surface-gc is cheap
+~~~~~~~~~~~~~~~~~~~~~~
+
+Surface-gc passes `--kept-pack-boundary` to `git repack`, which tells
+`git pack-objects` to treat objects in kept (stratify) packs as
+traversal boundaries. When the revision walk encounters a commit in a
+kept pack, it skips parent processing entirely — no ancestors are queued.
+Similarly, when tree or blob traversal encounters an object in a kept
+pack, it marks it seen and does not recurse further.
+
+This relies on the *closed-set property*: the union of all base-stratum
+packs is closed under object reachability. Every object transitively
+reachable from any configured anchor is guaranteed to be in some
+base-stratum pack, because base-stratum packs are created by
+`rev-list --objects` which enumerates the full transitive closure, and
+the cross-anchor filter ensures shared history is stratified exactly
+once into the union. The `^<last_stratified>` exclusion means
+individual packs are not self-contained, but the union is.
+`stratify-prune` preserves this invariant when retiring an anchor by
+relabeling the orphan pack's sidecar onto a surviving anchor instead
+of unlinking it; see "Cross-anchor coverage and the closed-set
+property" above for the rationale.
+
+If main's history is stratified up to 2 weeks ago, the walk only needs to
+traverse approximately 2 weeks of commits before hitting stratified objects
+and stopping. Both enumeration and writing are bounded by the young
+generation size.
+
+....
+  Full GC walk depth:        entire history (years)
+  Surface GC walk depth:      min-age window (weeks)
+
+  Full GC enumeration:       all objects
+  Surface GC enumeration:     only unstratified objects
+
+  Full GC rewrite:           all objects
+  Surface GC rewrite:         only unstratified objects
+....
+
+
+Integration with geometric repack
+----------------------------------
+
+Geometric repack skips base-stratum packs the same way it already skips cruft
+packs. Base-stratum packs are excluded from the geometric merge sequence and
+survive geometric repack unchanged.
+
+
+Configuration
+-------------
+
+maintenance.stratified.anchor::
+	Multi-valued. Refs to use as anchors for base-stratum packs. Each
+	value must be an exact ref name. The `stratify` task is a no-op
+	if no anchors are configured. No default.
+
+maintenance.stratified.min-age::
+	Approxidate. Only stratify objects from commits older than this.
+	Default: `2.weeks.ago`.
+
+maintenance.stratified.batch-size::
+	Integer. Maximum objects to stratify per anchor per run. `0` means
+	unlimited. Default: `0`.
+
+maintenance.stratified.cruft-expiration::
+	Approxidate. Cruft expiration threshold for surface-gc. Passed as
+	`--cruft-expiration` to linkgit:git-repack[1].
+	Falls back to `gc.pruneExpire` if unset. Default: `2.weeks.ago`.
+
+maintenance.stratified.grace-period::
+	Approxidate. How far behind stratify stratifying can lag before
+	surface-gc skips its run. The actual cutoff is `min-age` plus this
+	value. Default: `1.week.ago`.
+
+
+Steady-state behavior
+---------------------
+
+....
+Week 1, Day 1:
+  geometric-repack merges small regular packs (same as today)
+  stratify task stratifies objects reachable from main (>2 weeks old)
+  -> first base-stratum pack created
+
+Week 1, Day 2-6:
+  geometric-repack continues managing regular packs
+  stratify task incrementally stratifies new objects crossing min-age
+  -> base-stratum packs grow (or new small ones created)
+
+Week 1, Day 7:
+  surface-gc runs:
+  -> walks only unstratified objects (recent history)
+  -> unreachable unstratified objects -> cruft pack
+  -> expired cruft -> dropped
+  -> cost: proportional to ~2 weeks of history, not years
+
+Week 2+:
+  base-stratum packs ~ all of main's reachable history
+  regular packs ~ last 2 weeks of objects
+  cruft packs ~ 0-2 weeks of unreachable objects
+  surface-gc cost ~ constant (bounded by min-age window)
+....
+
+
+Safety properties
+-----------------
+
+The system is safe as long as validation is conservative (demote on any
+doubt):
+
+* A wrongly-demoted base-stratum pack becomes a regular pack. Its objects
+  are subject to normal GC, which correctly classifies them.
+* A base-stratum pack is never trusted beyond its anchor ref.
+* Force-push on main demotes base-stratum packs for main. The next GC
+  correctly identifies newly-unreachable objects.
+* A periodic full GC can serve as a safety net to catch any objects that
+  might have been incorrectly retained.
+
+
+Risks and trade-offs
+--------------------
+
+Delta compression across generations::
+	Objects in base-stratum packs are delta-compressed within the pack.
+	Objects in regular packs cannot delta against base-stratum pack objects
+	(different pack-objects invocation). This may increase total size
+	slightly vs. a single full repack. The cross-pack delta loss is bounded
+	by the active stratum size.
+
+Base-stratum pack proliferation::
+	Each anchor ref per run could create a new small base-stratum pack.
+	Mitigation: merge small base-stratum packs using the same geometric
+	progression, or accumulate into a single pack per anchor ref.
+
+Correctness of the skip optimization::
+	When surface-gc keeps base-stratum packs via `--keep-pack`, it assumes
+	every object in those packs is reachable. If validation misses a case
+	where this is not true, unreachable objects could survive indefinitely.
+	Mitigation: periodic full GC as a safety net.

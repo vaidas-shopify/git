@@ -961,6 +961,7 @@ integration_tests = [
   't7816-grep-binary-pattern.sh',
   't7817-grep-sparse-checkout.sh',
   't7900-maintenance.sh',
+  't7901-maintenance-stratify.sh',
   't8001-annotate.sh',
   't8002-blame.sh',
   't8003-blame-corner-cases.sh',

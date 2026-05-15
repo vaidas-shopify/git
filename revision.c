@@ -4351,6 +4351,21 @@ static struct commit *get_revision_1(struct rev_info *revs)
 			    comparison_date(revs, commit) < revs->max_age)
 				continue;
 
+			/*
+			 * When kept_pack_boundary is set, commits in kept
+			 * packs are traversal boundaries: do not process
+			 * their parents (the closed-set property guarantees
+			 * all ancestors are also in kept packs) and do not
+			 * emit them (they are already accounted for).
+			 */
+			if (revs->kept_pack_boundary &&
+			    has_object_kept_pack(revs->repo,
+						&commit->object.oid,
+						revs->keep_pack_cache_flags)) {
+				commit->object.flags |= SHOWN;
+				continue;
+			}
+
 			if (revs->reflog_info)
 				try_to_simplify_commit(revs, commit);
 			else if (revs->topo_walk_info)

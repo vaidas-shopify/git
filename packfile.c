@@ -449,7 +449,7 @@ void close_pack(struct packed_git *p)
 
 void unlink_pack_path(const char *pack_name, int force_delete)
 {
-	static const char *exts[] = {".idx", ".pack", ".rev", ".keep", ".bitmap", ".promisor", ".mtimes"};
+	static const char *exts[] = {".idx", ".pack", ".rev", ".keep", ".bitmap", ".promisor", ".mtimes", ".base-stratum"};
 	int i;
 	struct strbuf buf = STRBUF_INIT;
 	size_t plen;
@@ -805,10 +805,10 @@ struct packed_git *add_packed_git(struct repository *r, const char *path,
 		return NULL;
 
 	/*
-	 * ".promisor" is long enough to hold any suffix we're adding (and
+	 * ".base-stratum" is long enough to hold any suffix we're adding (and
 	 * the use xsnprintf double-checks that)
 	 */
-	alloc = st_add3(path_len, strlen(".promisor"), 1);
+	alloc = st_add3(path_len, strlen(".base-stratum"), 1);
 	p = alloc_packed_git(r, alloc);
 	memcpy(p->pack_name, path, path_len);
 
@@ -834,6 +834,10 @@ struct packed_git *add_packed_git(struct repository *r, const char *path,
 	xsnprintf(p->pack_name + path_len, alloc - path_len, ".mtimes");
 	if (!access(p->pack_name, F_OK))
 		p->is_cruft = 1;
+
+	xsnprintf(p->pack_name + path_len, alloc - path_len, ".base-stratum");
+	if (!access(p->pack_name, F_OK))
+		p->in_base_stratum = 1;
 
 	xsnprintf(p->pack_name + path_len, alloc - path_len, ".pack");
 	if (stat(p->pack_name, &st) || !S_ISREG(st.st_mode)) {

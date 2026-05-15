@@ -185,6 +185,72 @@ worktree-prune::
 	The `worktree-prune` task deletes stale or broken worktrees. See
 	linkgit:git-worktree[1] for more information.
 
+stratify::
+	The `stratify` task stratifies reachable objects from configured anchor
+	refs into separate base-stratum packs. These packs form the base
+	stratum in a Stratified garbage collection scheme: objects stratified
+	into base-stratum packs are protected from cruft expiration by
+	subsequent `surface-gc` runs.
++
+For each ref listed in `maintenance.stratified.anchor`, the task
+resolves the ref, walks its history with `git rev-list --objects`
+(bounded by `maintenance.stratified.min-age`), and packs the
+resulting objects into a base-stratum pack with a `.base-stratum` sidecar
+file. On subsequent runs, only objects newer than the last-stratified
+commit are walked, making the task incremental.
++
+The task also validates existing base-stratum packs before creating new
+ones: if an anchor ref has been deleted or force-pushed past the
+recorded anchor commit, the corresponding pack is demoted to a regular
+pack by removing its `.base-stratum` file.
++
+Anchors are also deduplicated at the OID level within a single run.
+If two configured anchors resolve to the same commit (for example,
+`refs/heads/main` and a release branch that was just cut from it), only
+the first-listed anchor is stratified; the second is recorded as
+`skipped/reason=duplicate-oid` in trace2 output. The follower's
+surface-gc readiness check is satisfied by the primary's sidecar via an
+OID-equivalence fallback, so the dedup is transparent. Once the anchors
+diverge in OID, the follower stratifies independently on the next run.
++
+The task requires at least one `maintenance.stratified.anchor` to be
+configured; it is a no-op otherwise.
+
+stratify-prune::
+	The `stratify-prune` task demotes base-stratum packs whose anchor
+	ref is no longer listed in `maintenance.stratified.anchor`. Only
+	the `.base-stratum` and `.keep` sidecars are removed; the `.pack`
+	and `.idx` files remain on disk and become regular packs that
+	`geometric-repack` will absorb on its normal cadence.
++
+The `stratify` task warns about orphaned anchors on every run but does
+not demote them, so a typo or a temporary edit to
+`maintenance.stratified.anchor` does not blast away curated packs. The
+`stratify-prune` task is the explicit cleanup step.
++
+For safety, the task refuses to run when no anchors are configured at
+all (which would otherwise demote every base-stratum pack in the
+repository). Remove sidecars by hand if that is the intent.
+
+surface-gc::
+	The `surface-gc` task performs lightweight garbage collection that
+	only processes unstratified (active stratum) objects. Base-stratum packs
+	are kept intact via `--keep-pack`, so the reachability walk and
+	repack only cover the active stratum.
++
+Before running, the task checks that stratify stratifying has caught up
+sufficiently: for each configured anchor ref, the commit date of the
+last-stratified commit must be newer than the combined threshold of
+`maintenance.stratified.min-age` plus
+`maintenance.stratified.grace-period`. If stratifying is lagging behind,
+the task is skipped because the active stratum would still be too
+large for surface-gc to save meaningful work over a full repack.
++
+This task is most useful on large repositories where a full `gc` is
+too expensive to run frequently. As stratify progressively stratifies more
+of the old history, the active stratum shrinks and surface-gc becomes
+increasingly cheap.
+
 OPTIONS
 -------
 --auto::

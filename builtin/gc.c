@@ -28,6 +28,9 @@
 #include "strvec.h"
 #include "commit.h"
 #include "commit-graph.h"
+#include "commit-reach.h"
+#include "odb/source-files.h"
+#include "pack-base-stratum.h"
 #include "packfile.h"
 #include "object-file.h"
 #include "pack.h"
@@ -48,6 +51,7 @@
 #include "setup.h"
 #include "trace2.h"
 #include "worktree.h"
+#include "oidset.h"
 
 #define FAILED_RUN "failed to run %s"
 
@@ -263,6 +267,10 @@ enum maintenance_task_label {
 	TASK_REFLOG_EXPIRE,
 	TASK_WORKTREE_PRUNE,
 	TASK_RERERE_GC,
+	TASK_STRATIFY,
+	TASK_STRATIFY_PRUNE,
+	TASK_CONSOLIDATE_STRATUM,
+	TASK_SURFACE_GC,
 
 	/* Leave as final value */
 	TASK__COUNT
@@ -1669,6 +1677,1693 @@ out:
 	return ret;
 }
 
+/*
+ * Base-stratum maintenance task: incrementally stratify objects reachable from
+ * configured anchor refs into base-stratum packs (the "base stratum"
+ * in Stratified GC).
+ */
+
+/*
+ * Validate all base-stratum packs: check that each pack's anchor ref
+ * still exists and still descends from the recorded anchor commit.
+ * Demote invalid packs by removing the .base-stratum file.
+ */
+struct base_stratum_pack_entry {
+	struct packed_git *pack;
+	struct object_id anchor_commit;
+	char *anchor_ref;
+	uint32_t stratified_timestamp;
+};
+
+struct base_stratum_pack_group {
+	struct base_stratum_pack_entry *entries;
+	size_t nr;
+	size_t alloc;
+};
+
+/*
+ * Validate a single base-stratum pack: check that the anchor ref exists
+ * and that the recorded anchor commit is an ancestor of the current
+ * ref tip. Returns 0 on success, nonzero on failure.
+ */
+static int validate_single_base_stratum_pack(struct repository *r,
+					  struct base_stratum_pack_entry *entry)
+{
+	struct object_id ref_oid;
+	struct child_process merge_base = CHILD_PROCESS_INIT;
+
+	if (!refs_resolve_ref_unsafe(get_main_ref_store(r),
+				     entry->anchor_ref,
+				     RESOLVE_REF_READING,
+				     &ref_oid, NULL)) {
+		warning(_("stratify: anchor ref '%s' no longer exists, "
+			  "demoting pack %s"),
+			entry->anchor_ref, entry->pack->pack_name);
+		return -1;
+	}
+
+	merge_base.git_cmd = 1;
+	strvec_pushl(&merge_base.args, "merge-base", "--is-ancestor",
+		     oid_to_hex(&entry->anchor_commit),
+		     oid_to_hex(&ref_oid), NULL);
+	if (run_command(&merge_base)) {
+		warning(_("stratify: anchor commit %s is not ancestor "
+			  "of %s tip, demoting pack %s"),
+			oid_to_hex(&entry->anchor_commit),
+			entry->anchor_ref, entry->pack->pack_name);
+		return -1;
+	}
+
+	return 0;
+}
+
+/*
+ * Validate all base-stratum packs.
+ *
+ * Each pack in an anchor's group is checked independently against the
+ * current ref tip: if the pack's recorded anchor_commit is no longer an
+ * ancestor of the ref, the pack is demoted. We deliberately do not rely
+ * on stratified_timestamp ordering to short-circuit ("cascade") later
+ * packs in the same group when an earlier one fails — that optimisation
+ * silently mis-handles any timestamp source that isn't strictly monotone
+ * with commit-graph order (clock rollbacks, manual sidecar edits, or any
+ * future code path that reuses an older timestamp on a newer pack), and
+ * for the typical group sizes consolidate-stratum maintains the per-pack
+ * cost is negligible.
+ */
+/*
+ * Collect all base-stratum packs, grouped by anchor_ref.
+ * Each string_list entry's util points to an base_stratum_pack_group.
+ * Packs whose .base-stratum file cannot be loaded are demoted and skipped.
+ */
+static void collect_base_stratum_pack_groups(struct repository *r,
+					 struct string_list *ref_groups)
+{
+	struct packed_git *p;
+
+	repo_for_each_pack(r, p) {
+		struct base_stratum_data adata = { 0 };
+		struct string_list_item *item;
+		struct base_stratum_pack_group *group;
+		struct base_stratum_pack_entry *entry;
+
+		if (!p->in_base_stratum)
+			continue;
+		if (load_pack_base_stratum(p, &adata)) {
+			warning(_("stratify: cannot load .base-stratum for %s, demoting"),
+				p->pack_name);
+			remove_pack_base_stratum(p);
+			continue;
+		}
+
+		item = string_list_lookup(ref_groups, adata.anchor_ref);
+		if (!item) {
+			item = string_list_insert(ref_groups, adata.anchor_ref);
+			item->util = xcalloc(1, sizeof(struct base_stratum_pack_group));
+		}
+
+		group = item->util;
+		ALLOC_GROW(group->entries, group->nr + 1, group->alloc);
+		entry = &group->entries[group->nr++];
+		entry->pack = p;
+		oidcpy(&entry->anchor_commit, &adata.anchor_commit);
+		entry->anchor_ref = xstrdup(adata.anchor_ref);
+		entry->stratified_timestamp = adata.stratified_timestamp;
+
+		clear_base_stratum_data(&adata);
+	}
+}
+
+static void free_base_stratum_pack_groups(struct string_list *ref_groups)
+{
+	size_t i;
+
+	for (i = 0; i < ref_groups->nr; i++) {
+		struct base_stratum_pack_group *group = ref_groups->items[i].util;
+		size_t j;
+
+		for (j = 0; j < group->nr; j++)
+			free(group->entries[j].anchor_ref);
+		free(group->entries);
+		free(group);
+	}
+	string_list_clear(ref_groups, 0);
+}
+
+static void validate_stratify_packs(struct string_list *configured,
+				    int quiet)
+{
+	struct repository *r = the_repository;
+	struct string_list ref_groups = STRING_LIST_INIT_DUP;
+	size_t i, orphan_groups = 0;
+
+	collect_base_stratum_pack_groups(r, &ref_groups);
+
+	/*
+	 * For each configured anchor ref, validate every pack in the
+	 * group independently. Orphan groups (anchors with packs on
+	 * disk but no longer in maintenance.stratified.anchor) are
+	 * surfaced via warning + trace2 but NOT demoted here;
+	 * automatic demotion would amplify a config typo into a
+	 * many-GB re-stratification. The stratify-prune task is the
+	 * explicit way to reclaim them.
+	 */
+	for (i = 0; i < ref_groups.nr; i++) {
+		struct string_list_item *item = &ref_groups.items[i];
+		struct base_stratum_pack_group *group = item->util;
+		const char *anchor_ref = item->string;
+		size_t j;
+
+		if (!unsorted_string_list_has_string(configured, anchor_ref)) {
+			orphan_groups++;
+			trace2_data_string("stratify", r, "orphan-anchor",
+					   anchor_ref);
+			if (!quiet)
+				warning(_("stratify: anchor '%s' has %"PRIuMAX
+					  " base-stratum pack(s) but is no "
+					  "longer configured; run "
+					  "'git maintenance run --task=stratify-prune' "
+					  "to reclaim"),
+					anchor_ref, (uintmax_t)group->nr);
+			/*
+			 * Skip per-pack validation for orphans: their
+			 * anchor_ref may have been deleted along with the
+			 * config entry, in which case validate_single_*
+			 * would demote anyway. Pruning is the right tool.
+			 */
+			continue;
+		}
+
+		for (j = 0; j < group->nr; j++) {
+			if (validate_single_base_stratum_pack(r, &group->entries[j]))
+				remove_pack_base_stratum(group->entries[j].pack);
+		}
+	}
+
+	trace2_data_intmax("stratify", r, "orphan-groups", orphan_groups);
+	free_base_stratum_pack_groups(&ref_groups);
+}
+
+/*
+ * Find the most-advanced base-stratum frontier reachable along
+ * tip_oid's history. Among all base-stratum sidecars, this returns the
+ * anchor_commit (regardless of which anchor_ref recorded it) that
+ *
+ *   - is an ancestor of tip_oid, AND
+ *   - has the latest committer date,
+ *
+ * suitable for use as a `^bound` argument to rev-list when stratifying
+ * tip_oid: everything reachable from this commit is already in some
+ * base-stratum pack, so we can skip walking it again. Returns a heap
+ * pointer the caller must free, or NULL if no anchor_commit covers any
+ * prefix of tip_oid's history.
+ *
+ * The lookup is cross-anchor on purpose: a pack written for some other
+ * anchor that happens to cover a prefix of this anchor's history is
+ * just as good as a pack of our own. The per-repo union of base-stratum
+ * packs is what carries the closed-set property; per-anchor closure was
+ * a stronger guarantee than we need.
+ */
+static struct object_id *find_stratified_ancestor(struct repository *r,
+						  const struct object_id *tip_oid)
+{
+	struct packed_git *p;
+	struct object_id *best = NULL;
+	timestamp_t best_date = 0;
+	struct commit *tip_commit;
+
+	/*
+	 * tip_oid comes from refs_resolve_ref_unsafe(), which for an
+	 * annotated tag is the tag object's OID, not the commit it
+	 * points to. Peel through tags before looking up the commit so
+	 * tag-backed anchors are handled the same as branch tips.
+	 */
+	tip_commit = lookup_commit_reference_gently(r, tip_oid, 1);
+	if (!tip_commit || repo_parse_commit(r, tip_commit))
+		return NULL;
+
+	repo_for_each_pack(r, p) {
+		struct base_stratum_data adata = { 0 };
+		struct commit *anchor_commit;
+
+		if (!p->in_base_stratum)
+			continue;
+		if (load_pack_base_stratum(p, &adata))
+			continue;
+
+		anchor_commit = lookup_commit(r, &adata.anchor_commit);
+		if (!anchor_commit || repo_parse_commit(r, anchor_commit)) {
+			clear_base_stratum_data(&adata);
+			continue;
+		}
+
+		/*
+		 * Only consider anchors that lie on tip_oid's first-parent
+		 * ancestry — using a non-ancestor as ^bound would over-
+		 * exclude (descendants of tip_oid drag too much along)
+		 * or have no effect (unrelated commits). repo_in_merge_bases
+		 * can also return -1 on walk failure; treat that like a
+		 * non-ancestor and skip.
+		 */
+		if (repo_in_merge_bases(r, anchor_commit, tip_commit) <= 0) {
+			clear_base_stratum_data(&adata);
+			continue;
+		}
+
+		if (anchor_commit->date > best_date) {
+			free(best);
+			best = xmalloc(sizeof(*best));
+			oidcpy(best, &adata.anchor_commit);
+			best_date = anchor_commit->date;
+		}
+		clear_base_stratum_data(&adata);
+	}
+
+	return best;
+}
+
+/*
+ * Compute how recently tip_oid's history has been stratified, looking
+ * across all configured anchors' packs.
+ *
+ * Unlike find_stratified_ancestor() (which only accepts strict
+ * ancestors so it can be safely used as a rev-list `^bound`), this
+ * helper also accepts a pack whose anchor_commit is a *descendant* of
+ * tip_oid: such a pack's coverage strictly contains all of tip_oid's
+ * reachables, so it counts as full coverage and the frontier on this
+ * anchor's history is at tip_oid itself.
+ *
+ *   - For each pack with anchor_commit C ancestor of tip_oid, the
+ *     candidate frontier date is C's committer date.
+ *   - For each pack with anchor_commit C descendant of tip_oid, the
+ *     candidate frontier date is tip_oid's own committer date
+ *     (clamped — coverage extends past tip_oid but the anchor's own
+ *     history ends there).
+ *   - Packs unrelated to tip_oid contribute nothing.
+ *
+ * Returns the maximum candidate date, or 0 if no pack covers any
+ * portion of tip_oid's history.
+ */
+static timestamp_t stratified_frontier_date(struct repository *r,
+					    const struct object_id *tip_oid)
+{
+	struct packed_git *p;
+	timestamp_t best = 0;
+	struct commit *tip_commit;
+
+	/* See find_stratified_ancestor() for why we peel through tags. */
+	tip_commit = lookup_commit_reference_gently(r, tip_oid, 1);
+	if (!tip_commit || repo_parse_commit(r, tip_commit))
+		return 0;
+
+	repo_for_each_pack(r, p) {
+		struct base_stratum_data adata = { 0 };
+		struct commit *anchor_commit;
+		timestamp_t cand;
+		int anc, desc;
+
+		if (!p->in_base_stratum)
+			continue;
+		if (load_pack_base_stratum(p, &adata))
+			continue;
+
+		anchor_commit = lookup_commit(r, &adata.anchor_commit);
+		if (!anchor_commit || repo_parse_commit(r, anchor_commit)) {
+			clear_base_stratum_data(&adata);
+			continue;
+		}
+
+		anc = repo_in_merge_bases(r, anchor_commit, tip_commit);
+		if (anc < 0) {
+			clear_base_stratum_data(&adata);
+			continue;
+		}
+		if (anc) {
+			/* anchor_commit is ancestor of tip_oid */
+			cand = anchor_commit->date;
+		} else {
+			desc = repo_in_merge_bases(r, tip_commit,
+						   anchor_commit);
+			if (desc <= 0) {
+				/* error or unrelated histories */
+				clear_base_stratum_data(&adata);
+				continue;
+			}
+			/* descendant: full coverage of tip */
+			cand = tip_commit->date;
+		}
+
+		if (cand > best)
+			best = cand;
+		clear_base_stratum_data(&adata);
+	}
+
+	return best;
+}
+
+/*
+ * Filter OIDs from rev_list_out that already exist in any base-stratum
+ * pack — regardless of which anchor wrote it. Two anchors that share
+ * history would otherwise pack the shared objects twice (once each);
+ * with this cross-anchor filter, each shared object lands in whichever
+ * pack is written first, and later packs in the same run (or in
+ * subsequent runs) carry only their own deltas relative to the
+ * already-stratified union. The per-repo union of base-stratum packs
+ * remains closed under reachability from any configured anchor — the
+ * weaker guarantee than per-anchor closure, which is what cascade
+ * demotion relies on (and which still holds: a demoted pack's .pack
+ * file stays on disk and gets absorbed by the next geometric repack).
+ *
+ * Returns the number of OIDs filtered out.
+ */
+static size_t filter_already_packed_oids(struct strbuf *rev_list_out)
+{
+	struct packed_git **existing = NULL;
+	size_t existing_nr = 0, existing_alloc = 0;
+	struct packed_git *p;
+	struct strbuf filtered = STRBUF_INIT;
+	const char *cur, *end;
+	size_t filtered_count = 0;
+
+	repo_for_each_pack(the_repository, p) {
+		if (!p->in_base_stratum)
+			continue;
+		if (open_pack_index(p))
+			continue;
+
+		ALLOC_GROW(existing, existing_nr + 1, existing_alloc);
+		existing[existing_nr++] = p;
+	}
+
+	if (!existing_nr) {
+		free(existing);
+		return 0;
+	}
+
+	cur = rev_list_out->buf;
+	end = rev_list_out->buf + rev_list_out->len;
+
+	while (cur < end) {
+		const char *eol = memchr(cur, '\n', end - cur);
+		size_t line_len;
+		struct object_id oid;
+		int found = 0;
+
+		if (!eol)
+			break;
+		line_len = eol + 1 - cur;
+
+		if (!get_oid_hex(cur, &oid)) {
+			size_t k;
+			for (k = 0; k < existing_nr; k++) {
+				if (find_pack_entry_one(&oid, existing[k])) {
+					found = 1;
+					break;
+				}
+			}
+		}
+
+		if (found)
+			filtered_count++;
+		else
+			strbuf_add(&filtered, cur, line_len);
+
+		cur = eol + 1;
+	}
+
+	strbuf_reset(rev_list_out);
+	strbuf_addbuf(rev_list_out, &filtered);
+	strbuf_release(&filtered);
+	free(existing);
+
+	return filtered_count;
+}
+
+/*
+ * Populate `out` with anchor refs from "maintenance.stratified.anchor",
+ * skipping duplicates while preserving config order. Returns 0 on
+ * success, -1 if no anchors are configured.
+ *
+ * Duplicates can arise from overlapping `includeIf` rules that pull the
+ * same anchor definition into the merged config more than once. Each
+ * extra entry would re-stratify the same ref, doing redundant work and
+ * doubling trace2 output. `out` must be initialized by the caller in
+ * STRING_LIST_INIT_DUP mode and cleared afterwards.
+ */
+static int load_unique_stratify_anchors(struct repository *r,
+					struct string_list *out)
+{
+	const struct string_list *raw = NULL;
+	size_t i;
+
+	if (repo_config_get_string_multi(r, "maintenance.stratified.anchor",
+					 &raw))
+		return -1;
+
+	for (i = 0; i < raw->nr; i++) {
+		const char *anchor_ref = raw->items[i].string;
+		if (!unsorted_string_list_has_string(out, anchor_ref))
+			string_list_append(out, anchor_ref);
+	}
+
+	return 0;
+}
+
+static int maintenance_task_stratify(struct maintenance_run_opts *opts,
+				       struct gc_config *cfg UNUSED)
+{
+	struct repository *r = the_repository;
+	struct string_list anchors = STRING_LIST_INIT_DUP;
+	struct oidset stratified_oids = OIDSET_INIT;
+	const char *min_age_str = "2.weeks.ago";
+	timestamp_t min_age_ts;
+	unsigned long batch_size = 0;
+	int result = 0;
+	size_t i;
+
+	if (load_unique_stratify_anchors(r, &anchors)) {
+		if (!opts->quiet)
+			fprintf(stderr, _("stratify: skipped, no anchor refs configured\n"));
+		string_list_clear(&anchors, 0);
+		return 0;
+	}
+
+	/* Validate existing base-stratum packs before stratifying new ones */
+	validate_stratify_packs(&anchors, opts->quiet);
+
+	repo_config_get_string_tmp(r, "maintenance.stratified.min-age",
+				   &min_age_str);
+	min_age_ts = approxidate(min_age_str);
+
+	repo_config_get_ulong(r, "maintenance.stratified.batch-size",
+			      &batch_size);
+
+	trace2_data_intmax("stratify", r, "anchors", anchors.nr);
+
+	for (i = 0; i < anchors.nr; i++) {
+		const char *anchor_ref = anchors.items[i].string;
+		struct object_id tip_oid;
+		struct object_id *last_stratified = NULL;
+		struct child_process rev_list = CHILD_PROCESS_INIT;
+		struct child_process pack_proc = CHILD_PROCESS_INIT;
+		struct strbuf rev_list_out = STRBUF_INIT;
+		struct strbuf pack_hash = STRBUF_INIT;
+		struct packed_git *new_pack;
+		char *pack_prefix = NULL;
+		char *pack_path = NULL;
+
+		trace2_region_enter("stratify", anchor_ref, r);
+
+		/* Resolve the anchor ref */
+		if (!refs_resolve_ref_unsafe(get_main_ref_store(r),
+					     anchor_ref, RESOLVE_REF_READING,
+					     &tip_oid, NULL)) {
+			warning(_("stratify: cannot resolve anchor ref '%s'"),
+				anchor_ref);
+			trace2_data_string("stratify", r, "skipped/reason",
+					   "unresolvable-ref");
+			trace2_region_leave("stratify", anchor_ref, r);
+			continue;
+		}
+
+		/*
+		 * OID-level dedup: if a prior anchor in this run already
+		 * stratified the same tip OID, the resulting pack covers
+		 * the identical reachable object set. Walking and packing
+		 * this anchor's history again would just produce a
+		 * byte-equivalent pack under a different filename. Skip
+		 * the work; surface-gc readiness for this anchor is
+		 * resolved via the prior anchor's sidecar (see
+		 * stratify_stratifying_caught_up).
+		 *
+		 * Once the anchors diverge in OID (e.g., the primary
+		 * advances), the follower is no longer deduped and gets
+		 * its own stratification on the next run.
+		 */
+		if (oidset_contains(&stratified_oids, &tip_oid)) {
+			if (!opts->quiet)
+				fprintf(stderr,
+					_("stratify: '%s' resolves to a commit "
+					  "already stratified by another anchor "
+					  "in this run; skipping\n"), anchor_ref);
+			trace2_data_string("stratify", r, "skipped/reason",
+					   "duplicate-oid");
+			trace2_region_leave("stratify", anchor_ref, r);
+			continue;
+		}
+		oidset_insert(&stratified_oids, &tip_oid);
+
+		/*
+		 * Find the most-advanced base-stratum frontier on this
+		 * anchor's history, regardless of which anchor first
+		 * stratified it. If another configured anchor's pack
+		 * already covers a prefix of our reachables, use its
+		 * anchor_commit as ^bound to skip the walk.
+		 */
+		last_stratified = find_stratified_ancestor(r, &tip_oid);
+
+		/*
+		 * Use rev-list to find objects reachable from the anchor
+		 * ref (up to min-age) that are not reachable from the
+		 * last-stratified commit.
+		 *
+		 * --in-commit-order is required for the batch-size
+		 * truncation below to work: without it, rev-list emits
+		 * all commits first and then all reachable trees and
+		 * blobs, so there are no inline commit boundaries to
+		 * truncate at and the trees/blobs of an included commit
+		 * would be cut off. With it, each commit is followed by
+		 * the trees and blobs reached through that commit, so
+		 * we can truncate at the next commit line and the
+		 * preserved prefix has full object closure for the
+		 * commits it includes.
+		 *
+		 * git rev-list --objects --in-commit-order --reverse \
+		 *	--before=<min-age> <tip> [^<last_stratified>]
+		 */
+		rev_list.git_cmd = 1;
+		strvec_pushl(&rev_list.args, "rev-list", "--objects",
+			     "--in-commit-order", "--reverse", NULL);
+		strvec_pushf(&rev_list.args, "--before=%"PRItime, min_age_ts);
+		strvec_push(&rev_list.args, oid_to_hex(&tip_oid));
+		if (last_stratified)
+			strvec_pushf(&rev_list.args, "^%s",
+				     oid_to_hex(last_stratified));
+		/*
+		 * Do NOT pass --quiet to rev-list here: we need its
+		 * stdout output to feed pack-objects. --quiet suppresses
+		 * all output and would make the task a silent no-op.
+		 */
+
+		rev_list.out = -1;
+		if (start_command(&rev_list)) {
+			warning(_("stratify: failed to start rev-list for '%s'"),
+				anchor_ref);
+			free(last_stratified);
+			trace2_region_leave("stratify", anchor_ref, r);
+			continue;
+		}
+
+		strbuf_read(&rev_list_out, rev_list.out, 0);
+		close(rev_list.out);
+
+		if (finish_command(&rev_list)) {
+			warning(_("stratify: rev-list failed for '%s'"),
+				anchor_ref);
+			strbuf_release(&rev_list_out);
+			free(last_stratified);
+			trace2_region_leave("stratify", anchor_ref, r);
+			continue;
+		}
+
+		/* Nothing to stratify */
+		if (!rev_list_out.len) {
+			if (!opts->quiet) {
+				if (last_stratified)
+					fprintf(stderr,
+						_("stratify: '%s' already fully stratified at %s\n"),
+						anchor_ref, oid_to_hex(last_stratified));
+				else
+					fprintf(stderr,
+						_("stratify: no objects to stratify for '%s' (all newer than min-age)\n"),
+						anchor_ref);
+			}
+			trace2_data_intmax("stratify", r, "objects/stratified", 0);
+			strbuf_release(&rev_list_out);
+			free(last_stratified);
+			trace2_region_leave("stratify", anchor_ref, r);
+			continue;
+		}
+
+		/*
+		 * If batch-size is set, truncate at a commit boundary
+		 * after reaching the limit. This ensures all objects
+		 * (trees, blobs) belonging to the last included commit
+		 * are packed together. Truncating mid-commit would leave
+		 * some objects unpacked but record the commit as stratified,
+		 * causing subsequent runs to skip them permanently via
+		 * ^<last_stratified>.
+		 *
+		 * With --reverse, oldest objects come first, so truncation
+		 * keeps the oldest batch and defers newer objects to
+		 * subsequent runs.
+		 *
+		 * Also find the last commit OID in the (possibly truncated)
+		 * output to use as the anchor commit in the .base-stratum
+		 * sidecar.
+		 *
+		 * rev-list --objects format:
+		 *   commits: "<hex>\n"
+		 *   trees/blobs: "<hex> <path>\n"
+		 */
+		{
+			const char *p = rev_list_out.buf;
+			int truncated = 0;
+			unsigned long obj_count = 0;
+			int batch_exceeded = 0;
+			/*
+			 * batch_anchor tracks the last *fully-included*
+			 * commit; pending_anchor tracks the commit
+			 * currently being scanned, which is only known to
+			 * be fully included once we cross into the next
+			 * commit (or rev-list output ends) without having
+			 * exceeded the batch.
+			 */
+			struct object_id batch_anchor = { 0 };
+			int have_batch_anchor = 0;
+			struct object_id pending_anchor;
+			int have_pending_anchor = 0;
+			size_t pending_commit_offset = 0;
+
+			while (p < rev_list_out.buf + rev_list_out.len) {
+				const char *eol = memchr(p, '\n', rev_list_out.buf + rev_list_out.len - p);
+				if (!eol)
+					break;
+
+				/* Commit lines have no space (just hex OID) */
+				if (!memchr(p, ' ', eol - p)) {
+					if (batch_exceeded) {
+						/*
+						 * The pending commit pushed
+						 * us over: drop it from the
+						 * batch and record the prior
+						 * fully-included commit as
+						 * the anchor.
+						 *
+						 * If there is no prior
+						 * fully-included commit (a
+						 * single commit alone exceeds
+						 * the batch), truncating
+						 * would leave the batch
+						 * empty and stratification
+						 * would never advance.
+						 * Promote the pending commit
+						 * and overshoot instead, so
+						 * the run still makes
+						 * progress.
+						 */
+						if (have_batch_anchor) {
+							strbuf_setlen(&rev_list_out,
+								      pending_commit_offset);
+						} else {
+							if (have_pending_anchor) {
+								oidcpy(&batch_anchor,
+								       &pending_anchor);
+								have_batch_anchor = 1;
+							}
+							strbuf_setlen(&rev_list_out,
+								      p - rev_list_out.buf);
+						}
+						truncated = 1;
+						break;
+					}
+					/*
+					 * Crossing into a new commit confirms
+					 * the previously-pending commit is
+					 * fully included; promote it and
+					 * start tracking the new one.
+					 */
+					if (have_pending_anchor) {
+						oidcpy(&batch_anchor, &pending_anchor);
+						have_batch_anchor = 1;
+					}
+					pending_commit_offset = p - rev_list_out.buf;
+					if (get_oid_hex(p, &pending_anchor) == 0)
+						have_pending_anchor = 1;
+				}
+
+				obj_count++;
+				eol++;
+				if (batch_size > 0 && obj_count >= batch_size)
+					batch_exceeded = 1;
+				p = eol;
+			}
+
+			/*
+			 * Loop ended without truncating: the pending
+			 * commit's objects were fully consumed by rev-list
+			 * output, so it counts as fully included. This also
+			 * covers the case where the batch was exceeded
+			 * mid-way through the very last commit — we include
+			 * the remainder rather than truncate mid-commit.
+			 *
+			 * Always use the last fully-included commit as the
+			 * anchor, not the ref tip. The rev-list is bounded
+			 * by --before=<min-age>, so the last commit
+			 * represents the actual stratified frontier. Using
+			 * the ref tip would skip objects that are currently
+			 * newer than min-age but will become eligible in
+			 * future runs as time passes.
+			 */
+			if (!truncated && have_pending_anchor) {
+				oidcpy(&batch_anchor, &pending_anchor);
+				have_batch_anchor = 1;
+			}
+			if (have_batch_anchor)
+				oidcpy(&tip_oid, &batch_anchor);
+
+			if (!opts->quiet) {
+				if (truncated)
+					fprintf(stderr,
+						_("stratify: stratified %lu objects (batch limit) for '%s' at %s\n"),
+						obj_count, anchor_ref,
+						oid_to_hex(&tip_oid));
+				else
+					fprintf(stderr,
+						_("stratify: stratified %lu objects for '%s' at %s\n"),
+						obj_count, anchor_ref,
+						oid_to_hex(&tip_oid));
+			}
+
+			trace2_data_intmax("stratify", r, "objects/stratified",
+					   obj_count);
+			trace2_data_intmax("stratify", r, "batch/truncated",
+					   truncated);
+		}
+
+		/*
+		 * Filter out objects that already exist in any base-stratum
+		 * pack (cross-anchor): two anchors that share history would
+		 * otherwise pack the shared objects twice. ^<last_stratified>
+		 * already excludes most of them via the rev-list bound, but
+		 * the OID-level filter handles the remainder, including the
+		 * case where last_stratified comes from a different anchor's
+		 * pack and so doesn't match this anchor's own ^bound history.
+		 */
+		{
+			size_t skipped = filter_already_packed_oids(&rev_list_out);
+			if (skipped) {
+				trace2_data_intmax("stratify", r,
+						   "objects/already-packed",
+						   skipped);
+				if (!opts->quiet)
+					fprintf(stderr,
+						_("stratify: skipped %"PRIuMAX" objects already in base-stratum packs for '%s'\n"),
+						(uintmax_t)skipped, anchor_ref);
+			}
+		}
+
+		if (!rev_list_out.len) {
+			if (!opts->quiet)
+				fprintf(stderr,
+					_("stratify: all objects already packed for '%s'\n"),
+					anchor_ref);
+			strbuf_release(&rev_list_out);
+			free(last_stratified);
+			trace2_region_leave("stratify", anchor_ref, r);
+			continue;
+		}
+
+		/*
+		 * Pack the objects. Feed OIDs to pack-objects via stdin.
+		 * rev-list --objects outputs "oid path" lines; pack-objects
+		 * accepts this format.
+		 *
+		 * The basename embeds an anchor digest so two anchors whose
+		 * reachable object sets are identical (e.g., two refs at the
+		 * same commit) get distinct pack filenames and do not
+		 * overwrite each other's .base-stratum sidecar.
+		 */
+		{
+			struct strbuf basename = STRBUF_INIT;
+			format_base_stratum_pack_basename(&basename, r,
+							  anchor_ref);
+
+			pack_proc.git_cmd = 1;
+			strvec_push(&pack_proc.args, "pack-objects");
+			if (opts->quiet)
+				strvec_push(&pack_proc.args, "--quiet");
+			else
+				strvec_push(&pack_proc.args, "--no-quiet");
+			strvec_push(&pack_proc.args, basename.buf);
+
+			pack_prefix = strbuf_detach(&basename, NULL);
+		}
+
+		pack_proc.in = -1;
+		pack_proc.out = -1;
+
+		if (start_command(&pack_proc)) {
+			warning(_("stratify: failed to start pack-objects for '%s'"),
+				anchor_ref);
+			strbuf_release(&rev_list_out);
+			free(pack_prefix);
+			free(last_stratified);
+			trace2_region_leave("stratify", anchor_ref, r);
+			continue;
+		}
+
+		write_in_full(pack_proc.in, rev_list_out.buf, rev_list_out.len);
+		close(pack_proc.in);
+		strbuf_release(&rev_list_out);
+
+		strbuf_read(&pack_hash, pack_proc.out, the_hash_algo->hexsz);
+		close(pack_proc.out);
+		strbuf_trim_trailing_newline(&pack_hash);
+
+		if (finish_command(&pack_proc)) {
+			warning(_("stratify: pack-objects failed for '%s'"),
+				anchor_ref);
+			strbuf_release(&pack_hash);
+			free(pack_prefix);
+			free(last_stratified);
+			result = 1;
+			trace2_region_leave("stratify", anchor_ref, r);
+			continue;
+		}
+
+		if (!pack_hash.len) {
+			strbuf_release(&pack_hash);
+			free(pack_prefix);
+			free(last_stratified);
+			trace2_region_leave("stratify", anchor_ref, r);
+			continue;
+		}
+
+		/*
+		 * Write the .base-stratum sidecar for the new pack.
+		 * pack-objects writes to <base>-<hash>.pack and outputs
+		 * <hash> on stdout. We need to find the pack to write
+		 * the sidecar.
+		 */
+		{
+			char *full_prefix = pack_prefix;
+			pack_prefix = xstrfmt("%s-%s", full_prefix,
+					      pack_hash.buf);
+			free(full_prefix);
+		}
+		pack_path = xstrfmt("%s.idx", pack_prefix);
+
+		/*
+		 * Register the new pack with the in-memory packfile store
+		 * so that subsequent iterations of this loop (and any
+		 * helpers we call below) see it via repo_for_each_pack.
+		 * Without this, the cross-anchor filter cannot tell that
+		 * the pack we just wrote already covers the next anchor's
+		 * shared objects.
+		 */
+		{
+			struct odb_source_files *files =
+				odb_source_files_downcast(r->objects->sources);
+			new_pack = packfile_store_load_pack(files->packed,
+							    pack_path, 1);
+		}
+		if (new_pack) {
+			if (write_pack_base_stratum(new_pack, &tip_oid,
+						    anchor_ref,
+						    (uint32_t)time(NULL))) {
+				warning(_("stratify: failed to write base-stratum "
+					  "metadata for '%s'"), anchor_ref);
+				result = 1;
+			} else {
+				new_pack->in_base_stratum = 1;
+			}
+		}
+
+		free(pack_path);
+		free(pack_prefix);
+		strbuf_release(&pack_hash);
+		free(last_stratified);
+		trace2_region_leave("stratify", anchor_ref, r);
+	}
+
+	oidset_clear(&stratified_oids);
+	string_list_clear(&anchors, 0);
+	return result;
+}
+
+static int stratify_auto_condition(struct gc_config *cfg UNUSED)
+{
+	const struct string_list *anchors = NULL;
+
+	/* Only run if anchor refs are configured */
+	if (repo_config_get_string_multi(the_repository,
+					 "maintenance.stratified.anchor",
+					 &anchors))
+		return 0;
+
+	return anchors->nr > 0;
+}
+
+/*
+ * Consolidate base-stratum packs: apply geometric repacking within
+ * each anchor ref's pack set to bound the number of base-stratum packs.
+ */
+static int maintenance_task_consolidate_stratum(
+		struct maintenance_run_opts *opts,
+		struct gc_config *cfg UNUSED)
+{
+	struct repository *r = the_repository;
+	struct string_list ref_groups = STRING_LIST_INIT_DUP;
+	int split_factor = 2;
+	int result = 0;
+	size_t i;
+
+	repo_config_get_int(r, "maintenance.consolidate-stratify.splitfactor",
+			    &split_factor);
+	if (split_factor < 2)
+		split_factor = 2;
+
+	collect_base_stratum_pack_groups(r, &ref_groups);
+	trace2_data_intmax("consolidate-stratum", r, "groups",
+			   ref_groups.nr);
+
+	for (i = 0; i < ref_groups.nr; i++) {
+		struct base_stratum_pack_group *group = ref_groups.items[i].util;
+		struct packed_git **packs;
+		uint32_t split, j;
+		struct object_id best_anchor;
+		uint32_t best_timestamp = 0;
+		const char *anchor_ref = ref_groups.items[i].string;
+		struct child_process pack_proc = CHILD_PROCESS_INIT;
+		struct strbuf pack_hash = STRBUF_INIT;
+		char *pack_prefix, *pack_path;
+		struct packed_git *new_pack;
+
+		if (group->nr < 2)
+			continue;
+
+		trace2_region_enter("consolidate-stratum", anchor_ref, r);
+		trace2_data_intmax("consolidate-stratum", r, "packs/total",
+				   group->nr);
+
+		/* Build array sorted by object count (ascending) */
+		ALLOC_ARRAY(packs, group->nr);
+		for (j = 0; j < group->nr; j++)
+			packs[j] = group->entries[j].pack;
+		QSORT(packs, group->nr, pack_geometry_cmp);
+
+		split = compute_pack_geometry_split(packs, group->nr,
+						    split_factor);
+		if (split < 2) {
+			free(packs);
+			trace2_data_intmax("consolidate-stratum", r,
+					   "packs/merged", 0);
+			trace2_region_leave("consolidate-stratum",
+					    anchor_ref, r);
+			continue;
+		}
+		trace2_data_intmax("consolidate-stratum", r,
+				   "packs/merging", split);
+
+		/*
+		 * Find the latest anchor metadata among packs to merge.
+		 * The merged pack covers the full stratified range, so use the
+		 * latest stratified commit and timestamp.
+		 */
+		for (j = 0; j < group->nr; j++) {
+			struct base_stratum_pack_entry *e = &group->entries[j];
+			size_t k;
+			int below_split = 0;
+
+			for (k = 0; k < split; k++) {
+				if (packs[k] == e->pack) {
+					below_split = 1;
+					break;
+				}
+			}
+			if (below_split && e->stratified_timestamp > best_timestamp) {
+				best_timestamp = e->stratified_timestamp;
+				oidcpy(&best_anchor, &e->anchor_commit);
+			}
+		}
+
+		/*
+		 * Merge packs below the split using pack-objects --stdin-packs.
+		 * Positive basenames are included, ^-prefixed ones excluded.
+		 *
+		 * Use the same anchor-scoped basename as the stratify task so
+		 * two anchors whose merged pack contents collide do not
+		 * overwrite each other's pack and sidecar.
+		 */
+		pack_proc.git_cmd = 1;
+		strvec_push(&pack_proc.args, "pack-objects");
+		if (opts->quiet)
+			strvec_push(&pack_proc.args, "--quiet");
+		else
+			strvec_push(&pack_proc.args, "--no-quiet");
+		strvec_push(&pack_proc.args, "--stdin-packs");
+		{
+			struct strbuf basename = STRBUF_INIT;
+			format_base_stratum_pack_basename(&basename, r,
+							  anchor_ref);
+			strvec_push(&pack_proc.args, basename.buf);
+			pack_prefix = strbuf_detach(&basename, NULL);
+		}
+
+		pack_proc.in = -1;
+		pack_proc.out = -1;
+
+		if (start_command(&pack_proc)) {
+			warning(_("consolidate-stratify: failed to start "
+				  "pack-objects for '%s'"), anchor_ref);
+			free(pack_prefix);
+			free(packs);
+			result = 1;
+			trace2_region_leave("consolidate-stratum",
+					    anchor_ref, r);
+			continue;
+		}
+
+		{
+			struct strbuf stdin_buf = STRBUF_INIT;
+
+			/*
+			 * Only feed below-split packs as positive entries.
+			 * Do NOT ^-exclude above-split packs: base-stratum packs
+			 * must maintain the closed-set property (all objects
+			 * reachable from the anchor are present). Excluding
+			 * objects that also appear in above-split packs would
+			 * break this if cascade demotion later removes those
+			 * packs.
+			 */
+			for (j = 0; j < split; j++)
+				strbuf_addf(&stdin_buf, "%s\n",
+					    pack_basename(packs[j]));
+			write_in_full(pack_proc.in, stdin_buf.buf,
+				      stdin_buf.len);
+			strbuf_release(&stdin_buf);
+			close(pack_proc.in);
+		}
+
+		strbuf_read(&pack_hash, pack_proc.out, the_hash_algo->hexsz);
+		close(pack_proc.out);
+		strbuf_trim_trailing_newline(&pack_hash);
+
+		if (finish_command(&pack_proc) || !pack_hash.len) {
+			if (pack_hash.len)
+				warning(_("consolidate-stratify: pack-objects "
+					  "failed for '%s'"), anchor_ref);
+			strbuf_release(&pack_hash);
+			free(pack_prefix);
+			free(packs);
+			result = 1;
+			trace2_region_leave("consolidate-stratum",
+					    anchor_ref, r);
+			continue;
+		}
+
+		/* Write .base-stratum sidecar for the new merged pack */
+		{
+			char *full_prefix = pack_prefix;
+			pack_prefix = xstrfmt("%s-%s", full_prefix,
+					      pack_hash.buf);
+			free(full_prefix);
+		}
+		pack_path = xstrfmt("%s.idx", pack_prefix);
+		{
+			struct odb_source_files *files =
+				odb_source_files_downcast(r->objects->sources);
+			new_pack = packfile_store_load_pack(files->packed,
+							    pack_path, 1);
+		}
+		free(pack_path);
+		free(pack_prefix);
+		strbuf_release(&pack_hash);
+		if (!new_pack) {
+			/*
+			 * The merged pack was written but we cannot stat
+			 * its .pack file. Leave the source packs in place
+			 * so the anchor's objects remain reachable through
+			 * a recognized base-stratum pack; the orphaned
+			 * pack-objects output (if any) is harmless and can
+			 * be cleaned up by a later run.
+			 */
+			warning(_("consolidate-stratify: failed to register "
+				  "merged pack for '%s'; keeping source packs"),
+				anchor_ref);
+			free(packs);
+			result = 1;
+			trace2_region_leave("consolidate-stratum",
+					    anchor_ref, r);
+			continue;
+		}
+		if (write_pack_base_stratum(new_pack, &best_anchor,
+					    anchor_ref, best_timestamp)) {
+			/*
+			 * The merged pack file exists but its
+			 * .base-stratum sidecar (or .keep) was not
+			 * durably installed. Leave the source packs in
+			 * place so the anchor's objects remain reachable
+			 * through recognized base-stratum packs; the
+			 * orphaned merged pack is harmless and can be
+			 * cleaned up by a later run.
+			 */
+			warning(_("consolidate-stratify: failed to write "
+				  "base-stratum metadata for '%s'; keeping "
+				  "source packs"), anchor_ref);
+			free(packs);
+			result = 1;
+			trace2_region_leave("consolidate-stratum",
+					    anchor_ref, r);
+			continue;
+		}
+		new_pack->in_base_stratum = 1;
+
+		/* Remove the old packs that were merged */
+		{
+			char *packdir = mkpathdup("%s/pack",
+						  r->objects->sources->path);
+
+			for (j = 0; j < split; j++) {
+				struct strbuf base = STRBUF_INIT;
+
+				strbuf_addstr(&base, pack_basename(packs[j]));
+				strbuf_strip_suffix(&base, ".pack");
+				repack_remove_redundant_pack(r, packdir,
+							     base.buf);
+				strbuf_release(&base);
+			}
+			free(packdir);
+		}
+
+		free(packs);
+		trace2_data_intmax("consolidate-stratum", r,
+				   "packs/merged", split);
+		trace2_region_leave("consolidate-stratum", anchor_ref, r);
+	}
+
+	free_base_stratum_pack_groups(&ref_groups);
+	return result;
+}
+
+/*
+ * Demote base-stratum packs whose anchor_ref is no longer listed in
+ * maintenance.stratified.anchor. Only the .base-stratum and .keep
+ * sidecars are removed; the .pack and .idx files remain on disk and
+ * become regular packs that geometric-repack will absorb on its
+ * normal cadence. The change is therefore reversible until the next
+ * geometric-repack run.
+ *
+ * Refuses to run when no anchors are configured at all: that would
+ * demote every base-stratum pack in the repository, which is almost
+ * certainly not what the user wants and can be done by hand if they
+ * really mean it.
+ */
+static int repo_has_base_stratum_packs(struct repository *r)
+{
+	struct packed_git *p;
+	repo_for_each_pack(r, p)
+		if (p->in_base_stratum)
+			return 1;
+	return 0;
+}
+
+/*
+ * From a group of base-stratum packs that all share an anchor_ref (and
+ * have therefore all been validated as ancestors of that ref's tip),
+ * pick the entry whose anchor_commit has the smallest committer date.
+ * Entries are appended to the group in repo_for_each_pack iteration
+ * order, not by ancestry, so we cannot rely on entries[0]. Returns 0 on
+ * success and writes the chosen OID into *out; returns -1 if no entry's
+ * anchor_commit can be parsed.
+ */
+static int pick_oldest_anchor_commit(struct repository *r,
+				     const struct base_stratum_pack_group *group,
+				     struct object_id *out)
+{
+	timestamp_t best_date = TIME_MAX;
+	int found = 0;
+	size_t j;
+
+	for (j = 0; j < group->nr; j++) {
+		const struct base_stratum_pack_entry *e = &group->entries[j];
+		struct commit *c = lookup_commit(r, &e->anchor_commit);
+
+		if (!c || repo_parse_commit(r, c))
+			continue;
+		if (!found || c->date < best_date) {
+			oidcpy(out, &e->anchor_commit);
+			best_date = c->date;
+			found = 1;
+		}
+	}
+
+	return found ? 0 : -1;
+}
+
+/*
+ * Pick a relabel target for an orphan pack whose recorded anchor_commit
+ * is `orig_anchor_oid`. The sidecar we write must satisfy the next
+ * stratify validation pass, which requires anchor_commit to be an
+ * ancestor of anchor_ref's tip — otherwise the pack is demoted on the
+ * next run and the closed-set property breaks anyway. Three strategies,
+ * in preference order:
+ *
+ *   1. Preserve the orphan's anchor_commit if some surviving anchor's
+ *      tip already has it on history. The pack's frontier date is
+ *      unchanged, which is the cheapest outcome.
+ *
+ *   2. Otherwise substitute a merge-base of the orphan's anchor_commit
+ *      with a surviving anchor's tip. The merge-base lies on both
+ *      histories, and the orphan pack covers everything reachable from
+ *      its original anchor_commit (a descendant of the merge-base), so
+ *      the new claim "anchor_ref X covers anchor_commit Y" is true.
+ *      The recorded frontier date is earlier, which is harmless: future
+ *      stratify runs of the new anchor find their own packs' later
+ *      anchor_commits as the rev-list bound.
+ *
+ *   3. Otherwise (no commit-graph relation between the orphan and any
+ *      surviving anchor) borrow a surviving anchor's *own* recorded
+ *      anchor_commit, taken from the oldest (by committer date) of its
+ *      existing base-stratum packs. Cross-anchor dedup operates at the
+ *      OID level — see
+ *      filter_already_packed_oids() — not by commit ancestry, so
+ *      independently-rooted anchors can still share tree/blob OIDs
+ *      (the empty tree, an identical LICENSE / .gitignore blob, a
+ *      `.gitkeep`, etc.) and the orphan pack may exclusively hold
+ *      objects a surviving pack now references after that dedup.
+ *      Demoting in this case unlinks the orphan's .keep and drops the
+ *      closed-set guarantee that --kept-pack-boundary relies on, so
+ *      surface-gc's walk would skip those shared objects on a
+ *      subsequent run and the cruft repack would prune them. The
+ *      borrowed anchor_commit is, by construction, an ancestor of the
+ *      chosen anchor_ref's tip (the survivor's own pack was just
+ *      validated against it), and no newer than any other survivor
+ *      anchor_commit, so it cannot push find_stratified_ancestor past
+ *      the survivor's true frontier.
+ *
+ * Within each strategy we iterate `configured` in order so behavior is
+ * deterministic, but the choice no longer depends on whether the first
+ * configured anchor happens to be compatible — every configured anchor
+ * is considered.
+ *
+ * On success, writes the chosen ref into *out_anchor_ref (pointer into
+ * `configured`; do not free) and the chosen commit into
+ * *out_anchor_commit. Returns 0 on success, -1 only when no surviving
+ * anchor has a base-stratum pack of its own — at which point there is
+ * no kept set whose closure could be broken, and the caller can safely
+ * demote.
+ */
+static int find_relabel_target(struct repository *r,
+			       const struct object_id *orig_anchor_oid,
+			       const struct string_list *configured,
+			       const struct string_list *ref_groups,
+			       const char **out_anchor_ref,
+			       struct object_id *out_anchor_commit)
+{
+	struct commit *orig_anchor;
+	size_t i;
+
+	orig_anchor = lookup_commit(r, orig_anchor_oid);
+	if (!orig_anchor || repo_parse_commit(r, orig_anchor))
+		return -1;
+
+	for (i = 0; i < configured->nr; i++) {
+		const char *ref = configured->items[i].string;
+		struct object_id tip_oid;
+		struct commit *tip_commit;
+		int anc;
+
+		if (!refs_resolve_ref_unsafe(get_main_ref_store(r), ref,
+					     RESOLVE_REF_READING, &tip_oid,
+					     NULL))
+			continue;
+		tip_commit = lookup_commit_reference_gently(r, &tip_oid, 1);
+		if (!tip_commit || repo_parse_commit(r, tip_commit))
+			continue;
+		anc = repo_in_merge_bases(r, orig_anchor, tip_commit);
+		if (anc < 0)
+			continue;
+		if (anc) {
+			*out_anchor_ref = ref;
+			oidcpy(out_anchor_commit, orig_anchor_oid);
+			return 0;
+		}
+	}
+
+	for (i = 0; i < configured->nr; i++) {
+		const char *ref = configured->items[i].string;
+		struct object_id tip_oid;
+		struct commit *tip_commit;
+		struct commit_list *bases = NULL;
+
+		if (!refs_resolve_ref_unsafe(get_main_ref_store(r), ref,
+					     RESOLVE_REF_READING, &tip_oid,
+					     NULL))
+			continue;
+		tip_commit = lookup_commit_reference_gently(r, &tip_oid, 1);
+		if (!tip_commit || repo_parse_commit(r, tip_commit))
+			continue;
+		if (repo_get_merge_bases(r, orig_anchor, tip_commit, &bases)) {
+			free_commit_list(bases);
+			continue;
+		}
+		if (bases) {
+			*out_anchor_ref = ref;
+			oidcpy(out_anchor_commit, &bases->item->object.oid);
+			free_commit_list(bases);
+			return 0;
+		}
+	}
+
+	for (i = 0; i < configured->nr; i++) {
+		const char *ref = configured->items[i].string;
+		size_t k;
+
+		for (k = 0; k < ref_groups->nr; k++) {
+			struct base_stratum_pack_group *group;
+			struct object_id oldest;
+
+			if (strcmp(ref_groups->items[k].string, ref))
+				continue;
+			group = ref_groups->items[k].util;
+			if (!group || !group->nr)
+				break;
+			if (pick_oldest_anchor_commit(r, group, &oldest))
+				break;
+			*out_anchor_ref = ref;
+			oidcpy(out_anchor_commit, &oldest);
+			return 0;
+		}
+	}
+
+	return -1;
+}
+
+static int maintenance_task_stratify_prune(struct maintenance_run_opts *opts,
+					   struct gc_config *cfg UNUSED)
+{
+	struct repository *r = the_repository;
+	struct string_list ref_groups = STRING_LIST_INIT_DUP;
+	struct string_list configured = STRING_LIST_INIT_DUP;
+	size_t i, j, demoted = 0, relabeled = 0;
+
+	if (load_unique_stratify_anchors(r, &configured)) {
+		/*
+		 * No anchors configured. If the repo has no base-stratum
+		 * packs either, this task is just a no-op for a repository
+		 * that does not use stratification — stay silent so it can
+		 * sit in the default maintenance schedule without spamming.
+		 *
+		 * If packs exist with no anchors to protect them, demoting
+		 * everything would amplify a config typo into a many-GB
+		 * re-stratification on the next run. Refuse and surface a
+		 * warning instead.
+		 */
+		if (!repo_has_base_stratum_packs(r)) {
+			string_list_clear(&configured, 0);
+			return 0;
+		}
+		warning(_("stratify-prune: refusing to run with no configured "
+			  "anchors; remove .base-stratum sidecars by hand if "
+			  "that is intended"));
+		string_list_clear(&configured, 0);
+		return 0;
+	}
+
+	collect_base_stratum_pack_groups(r, &ref_groups);
+
+	/*
+	 * Relabel rather than demote when at least one surviving anchor
+	 * has a base-stratum pack of its own. Cross-anchor dedup means an
+	 * orphan pack may exclusively hold objects that surviving packs
+	 * reference; dropping its .base-stratum/.keep outright would
+	 * break the closed-set property under --kept-pack-boundary, and
+	 * surface-gc would later classify those shared objects as cruft.
+	 * Relabeling keeps the pack kept and folds it into the survivor's
+	 * group via consolidate-stratum's geometric merge.
+	 *
+	 * The per-pack target choice is made by find_relabel_target(),
+	 * which considers every configured anchor in three strategies
+	 * (preserve, merge-base substitute, survivor-anchor borrow) and
+	 * returns -1 only when no surviving anchor has a pack of its own
+	 * — at which point there is no kept set whose closure could be
+	 * broken and demotion is safe.
+	 */
+	for (i = 0; i < ref_groups.nr; i++) {
+		struct base_stratum_pack_group *group = ref_groups.items[i].util;
+		const char *anchor = ref_groups.items[i].string;
+
+		if (unsorted_string_list_has_string(&configured, anchor))
+			continue;
+
+		trace2_region_enter("stratify-prune", anchor, r);
+		for (j = 0; j < group->nr; j++) {
+			struct base_stratum_pack_entry *entry = &group->entries[j];
+			const char *target_anchor = NULL;
+			struct object_id target_commit;
+
+			if (!find_relabel_target(r, &entry->anchor_commit,
+						 &configured, &ref_groups,
+						 &target_anchor,
+						 &target_commit) &&
+			    !write_pack_base_stratum(entry->pack,
+						     &target_commit,
+						     target_anchor,
+						     entry->stratified_timestamp)) {
+				if (!opts->quiet)
+					fprintf(stderr,
+						_("stratify-prune: relabeled %s "
+						  "(anchor '%s' no longer configured) "
+						  "to surviving anchor '%s'\n"),
+						pack_basename(entry->pack),
+						anchor, target_anchor);
+				relabeled++;
+			} else {
+				if (!opts->quiet)
+					fprintf(stderr,
+						_("stratify-prune: demoting %s "
+						  "(anchor '%s' no longer configured)\n"),
+						pack_basename(entry->pack),
+						anchor);
+				remove_pack_base_stratum(entry->pack);
+				demoted++;
+			}
+		}
+		trace2_data_intmax("stratify-prune", r, "packs/processed-group",
+				   group->nr);
+		trace2_region_leave("stratify-prune", anchor, r);
+	}
+	trace2_data_intmax("stratify-prune", r, "packs/relabeled", relabeled);
+	trace2_data_intmax("stratify-prune", r, "packs/demoted", demoted);
+
+	free_base_stratum_pack_groups(&ref_groups);
+	string_list_clear(&configured, 0);
+	return 0;
+}
+
+static int consolidate_stratum_auto_condition(struct gc_config *cfg UNUSED)
+{
+	struct repository *r = the_repository;
+	struct string_list ref_groups = STRING_LIST_INIT_DUP;
+	int threshold = 0;
+	int should_run = 0;
+	size_t i;
+
+	repo_config_get_int(r, "maintenance.consolidate-stratify.auto",
+			    &threshold);
+	if (!threshold)
+		return 0;
+	if (threshold < 0)
+		return 1;
+
+	collect_base_stratum_pack_groups(r, &ref_groups);
+	for (i = 0; i < ref_groups.nr; i++) {
+		struct base_stratum_pack_group *group = ref_groups.items[i].util;
+		if (group->nr >= (size_t)threshold) {
+			should_run = 1;
+			break;
+		}
+	}
+	free_base_stratum_pack_groups(&ref_groups);
+	return should_run;
+}
+
+/*
+ * Surface GC: lightweight garbage collection that only processes
+ * unstratified (active stratum) objects. Base-stratum packs are kept
+ * intact via --keep-pack, so the reachability walk and repack only
+ * cover the active stratum.
+ */
+/*
+ * Check whether stratify stratifying has caught up sufficiently for
+ * surface-gc to be worthwhile. For each anchor ref, compare the
+ * commit date of the last-stratified commit against (now - min-age - grace).
+ * If stratifying is lagging behind by more than the grace period, the
+ * active stratum is still too large for surface-gc to save work.
+ */
+static int stratify_stratifying_caught_up(struct repository *r, int quiet)
+{
+	struct string_list anchors = STRING_LIST_INIT_DUP;
+	const char *min_age_str = "2.weeks.ago";
+	const char *grace_str = "1.week.ago";
+	timestamp_t now_ts, min_age_ts, grace_ts, cutoff_ts;
+	int ret = 1;
+	size_t i;
+
+	if (load_unique_stratify_anchors(r, &anchors)) {
+		ret = 0;
+		goto out;
+	}
+
+	repo_config_get_string_tmp(r, "maintenance.stratified.min-age",
+				   &min_age_str);
+	repo_config_get_string_tmp(r, "maintenance.stratified.grace-period",
+				   &grace_str);
+
+	/*
+	 * The cutoff is min-age + grace-period behind now.
+	 * Compute each as an offset from now and combine:
+	 *   cutoff = now - (now - min_age) - (now - grace)
+	 *          = now - min_age_offset - grace_offset
+	 */
+	now_ts = approxidate("now");
+	min_age_ts = approxidate(min_age_str);
+	grace_ts = approxidate(grace_str);
+	cutoff_ts = now_ts - (now_ts - min_age_ts) - (now_ts - grace_ts);
+
+	for (i = 0; i < anchors.nr; i++) {
+		const char *anchor_ref = anchors.items[i].string;
+		struct object_id tip_oid;
+		timestamp_t frontier_date;
+
+		if (!refs_resolve_ref_unsafe(get_main_ref_store(r),
+					     anchor_ref,
+					     RESOLVE_REF_READING,
+					     &tip_oid, NULL)) {
+			if (!quiet)
+				fprintf(stderr,
+					_("surface-gc: cannot resolve anchor '%s'\n"),
+					anchor_ref);
+			ret = 0;
+			goto out;
+		}
+
+		/*
+		 * Cross-anchor frontier lookup: any base-stratum pack
+		 * whose anchor_commit lies on this anchor's history
+		 * (ancestor of, or descendant containing, our tip)
+		 * contributes to our coverage. The descendant case
+		 * means another anchor's deeper pack fully covers our
+		 * history; the ancestor case means partial coverage up
+		 * to that anchor_commit. Pick the most recent such
+		 * frontier date.
+		 */
+		frontier_date = stratified_frontier_date(r, &tip_oid);
+
+		if (!frontier_date) {
+			if (!quiet)
+				fprintf(stderr,
+					_("surface-gc: anchor '%s' has no stratified commits yet\n"),
+					anchor_ref);
+			ret = 0;
+			goto out;
+		}
+
+		if (frontier_date < cutoff_ts) {
+			if (!quiet)
+				fprintf(stderr,
+					_("surface-gc: skipped, stratifying for '%s' is lagging "
+				  "(stratified up to [%s], need commits newer than "
+				  "stratify.min-age(%s) + surface-gc.grace-period(%s))\n"),
+				anchor_ref,
+				show_date(frontier_date, 0, DATE_MODE(SHORT)),
+				min_age_str, grace_str);
+			ret = 0;
+			goto out;
+		}
+	}
+
+out:
+	string_list_clear(&anchors, 0);
+	return ret;
+}
+
+static int maintenance_task_surface_gc(struct maintenance_run_opts *opts,
+				      struct gc_config *cfg UNUSED)
+{
+	struct repository *r = the_repository;
+	struct child_process child = CHILD_PROCESS_INIT;
+	struct packed_git *p;
+	const char *expiration = "2.weeks.ago";
+	int have_base_stratum = 0;
+	int kept_packs = 0;
+
+	if (repo_config_get_string_tmp(r, "maintenance.stratified.cruft-expiration",
+				       &expiration))
+		repo_config_get_string_tmp(r, "gc.pruneexpire",
+					   &expiration);
+
+	/*
+	 * Check if stratify stratifying has caught up enough for
+	 * surface-gc to be effective. If stratifying is lagging behind,
+	 * the active stratum is still too large and surface-gc
+	 * would be as expensive as a full repack.
+	 */
+	if (!stratify_stratifying_caught_up(r, opts->quiet)) {
+		trace2_data_string("surface-gc", r, "skipped/reason",
+				   "stratifying-not-caught-up");
+		return 0;
+	}
+
+	trace2_data_string("surface-gc", r, "expiration", expiration);
+
+	child.git_cmd = 1;
+	strvec_pushl(&child.args, "repack", "-d", "-l", "--cruft", NULL);
+	strvec_pushf(&child.args, "--cruft-expiration=%s", expiration);
+
+	if (opts->quiet)
+		strvec_push(&child.args, "--quiet");
+
+	/*
+	 * Keep all base-stratum packs intact and treat them as traversal
+	 * boundaries. The closed-set property guarantees that every
+	 * object transitively reachable from a stratified object is also
+	 * in a base-stratum pack, so the reachability walk can stop when
+	 * it hits an object in a kept pack.
+	 */
+	repo_for_each_pack(r, p) {
+		if (!p->in_base_stratum)
+			continue;
+		have_base_stratum = 1;
+		kept_packs++;
+		strvec_pushf(&child.args, "--keep-pack=%s",
+			     pack_basename(p));
+	}
+
+	trace2_data_intmax("surface-gc", r, "kept-packs", kept_packs);
+
+	if (have_base_stratum)
+		strvec_push(&child.args, "--kept-pack-boundary");
+
+	/*
+	 * If no base-stratum packs exist, this degrades to a normal
+	 * cruft repack (which is fine but expensive). In practice,
+	 * surface-gc is only useful after stratify has stratified objects.
+	 */
+	if (!have_base_stratum)
+		warning(_("surface-gc: no base-stratum packs found; "
+			  "this will be equivalent to a full cruft repack"));
+
+	if (run_command(&child))
+		return error(_("failed to perform surface garbage collection"));
+
+	return 0;
+}
+
+static int surface_gc_auto_condition(struct gc_config *cfg UNUSED)
+{
+	struct packed_git *p;
+	int have_base_stratum = 0;
+	int have_active_packs = 0;
+
+	/*
+	 * Surface GC is useful when there are both base-stratum packs
+	 * and regular (active-stratum) packs to process.
+	 */
+	repo_for_each_pack(the_repository, p) {
+		if (p->in_base_stratum)
+			have_base_stratum = 1;
+		else if (!p->is_cruft && !p->pack_keep)
+			have_active_packs = 1;
+		if (have_base_stratum && have_active_packs)
+			return 1;
+	}
+
+	return 0;
+}
+
 typedef int (*maintenance_task_fn)(struct maintenance_run_opts *opts,
 				   struct gc_config *cfg);
 typedef int (*maintenance_auto_fn)(struct gc_config *cfg);
@@ -1746,6 +3441,30 @@ static const struct maintenance_task tasks[] = {
 		.name = "rerere-gc",
 		.background = maintenance_task_rerere_gc,
 		.auto_condition = rerere_gc_condition,
+	},
+	[TASK_STRATIFY] = {
+		.name = "stratify",
+		.background = maintenance_task_stratify,
+		.auto_condition = stratify_auto_condition,
+	},
+	[TASK_STRATIFY_PRUNE] = {
+		.name = "stratify-prune",
+		.background = maintenance_task_stratify_prune,
+		/*
+		 * No auto_condition: pruning demotes packs and is only
+		 * safe when the user has explicitly opted in by selecting
+		 * the task with --task=stratify-prune.
+		 */
+	},
+	[TASK_CONSOLIDATE_STRATUM] = {
+		.name = "consolidate-stratum",
+		.background = maintenance_task_consolidate_stratum,
+		.auto_condition = consolidate_stratum_auto_condition,
+	},
+	[TASK_SURFACE_GC] = {
+		.name = "surface-gc",
+		.background = maintenance_task_surface_gc,
+		.auto_condition = surface_gc_auto_condition,
 	},
 };
 
@@ -1913,6 +3632,22 @@ static const struct maintenance_strategy geometric_strategy = {
 			.schedule = SCHEDULE_WEEKLY,
 		},
 		[TASK_WORKTREE_PRUNE] = {
+			.type = MAINTENANCE_TYPE_SCHEDULED | MAINTENANCE_TYPE_MANUAL,
+			.schedule = SCHEDULE_WEEKLY,
+		},
+		[TASK_STRATIFY] = {
+			.type = MAINTENANCE_TYPE_SCHEDULED | MAINTENANCE_TYPE_MANUAL,
+			.schedule = SCHEDULE_DAILY,
+		},
+		[TASK_STRATIFY_PRUNE] = {
+			.type = MAINTENANCE_TYPE_SCHEDULED | MAINTENANCE_TYPE_MANUAL,
+			.schedule = SCHEDULE_WEEKLY,
+		},
+		[TASK_CONSOLIDATE_STRATUM] = {
+			.type = MAINTENANCE_TYPE_SCHEDULED | MAINTENANCE_TYPE_MANUAL,
+			.schedule = SCHEDULE_DAILY,
+		},
+		[TASK_SURFACE_GC] = {
 			.type = MAINTENANCE_TYPE_SCHEDULED | MAINTENANCE_TYPE_MANUAL,
 			.schedule = SCHEDULE_WEEKLY,
 		},

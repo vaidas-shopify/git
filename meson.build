@@ -409,6 +409,7 @@ libgit_sources = [
   'oidmap.c',
   'oidset.c',
   'oidtree.c',
+  'pack-base-stratum.c',
   'pack-bitmap-write.c',
   'pack-bitmap.c',
   'pack-check.c',
