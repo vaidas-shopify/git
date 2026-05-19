@@ -133,3 +133,51 @@ maintenance.worktree-prune.auto::
 	negative value will force the task to run every time. Otherwise, a
 	positive value implies the command should run when the number of
 	prunable worktrees exceeds the value. The default value is 1.
+
+maintenance.stratified.anchor::
+	A multi-valued config option specifying refs to use as anchors for
+	base-stratum packs. Objects reachable from these refs (bounded by
+	`maintenance.stratified.min-age`) are stratified into base-stratum packs
+	that are protected from cruft expiration. Supports glob patterns
+	(e.g. `refs/heads/release/*`). The `stratify` task is a no-op
+	if no anchors are configured. No default value.
+
+maintenance.stratified.min-age::
+	An approxidate string controlling how old a commit must be before
+	its reachable objects are stratified. Only objects from commits older
+	than this threshold are included in base-stratum packs. This prevents
+	stratifying objects that are still in the active working set.
+	Defaults to `2.weeks.ago`.
+
+maintenance.stratified.batch-size::
+	Soft limit on the number of objects stratified per anchor ref per
+	maintenance run. When set to a positive value, the task stops once this
+	many objects have been written, at the next commit boundary (so the
+	recorded anchors always cover the pack's contents and a follow-up run
+	resumes cleanly). A single commit may exceed the limit so the task can
+	preserve closure and make progress. A value of `0` (the default) means
+	no limit. Common unit suffixes `k`, `m`, and `g` are supported.
++
+A base-stratum pack records the maximal antichain of fully-included
+commits it covers (one anchor per live branch), so an un-merged fork is
+stratified in a single run rather than one commit at a time: the sidecar
+simply lists an anchor for each branch and the next run's frontier
+excludes them all. Commits whose merge is still newer than
+`maintenance.stratified.min-age` remain in the active stratum until the
+merge ages past the threshold.
+
+maintenance.stratified.cruft-expiration::
+	An approxidate string controlling the cruft expiration threshold
+	for the `surface-gc` task. Unreachable objects in the active stratum
+	older than this value are deleted. This is passed as
+	`--cruft-expiration` to linkgit:git-repack[1].
+	If unset, falls back to `gc.pruneExpire`.
+	Defaults to `2.weeks.ago`.
+
+maintenance.stratified.grace-period::
+	An approxidate string controlling how far behind stratify stratifying
+	can lag before `surface-gc` skips its run. The task checks that each
+	anchor ref's last-stratified commit date is newer than the combined
+	threshold of `maintenance.stratified.min-age` plus this grace period.
+	If any anchor's stratifying frontier is older than this cutoff, surface-gc
+	is skipped. Defaults to `1.week.ago`.
