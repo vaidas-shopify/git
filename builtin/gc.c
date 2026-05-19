@@ -2448,6 +2448,139 @@ static int stratify_auto_condition(struct gc_config *cfg UNUSED)
  * intact via --keep-pack, so the reachability walk and repack only
  * cover the active stratum.
  */
+/*
+ * Check whether stratify stratifying has caught up sufficiently for
+ * surface-gc to be worthwhile. For each anchor ref, compare the
+ * commit date of the last-stratified commit against (now - min-age - grace).
+ * If stratifying is lagging behind by more than the grace period, the
+ * active stratum is still too large for surface-gc to save work.
+ */
+static int stratify_stratifying_caught_up(struct repository *r, int quiet)
+{
+	struct string_list anchors = STRING_LIST_INIT_DUP;
+	const char *min_age_str = "2.weeks.ago";
+	const char *grace_str = "1.week.ago";
+	timestamp_t now_ts, min_age_ts, grace_ts, cutoff_ts;
+	int ret = 1;
+	size_t i;
+
+	if (load_unique_stratify_anchors(r, &anchors)) {
+		ret = 0;
+		goto out;
+	}
+
+	repo_config_get_string_tmp(r, "maintenance.stratified.min-age",
+				   &min_age_str);
+	repo_config_get_string_tmp(r, "maintenance.stratified.grace-period",
+				   &grace_str);
+
+	/*
+	 * min-age is the timestamp boundary stratify packs before (matching
+	 * the --before=<min-age> rev-list elsewhere); grace-period is an
+	 * additional relative duration behind now. The cutoff is min-age
+	 * pushed back by the grace duration:
+	 *   cutoff = min_age - (now - grace)
+	 * Both values must be relative durations (e.g. "2.weeks.ago"); parse
+	 * them carefully so a malformed value is rejected rather than silently
+	 * treated as "now" (which would let surface-gc run prematurely).
+	 */
+	{
+		int min_err = 0, grace_err = 0;
+		timestamp_t grace_offset;
+
+		now_ts = approxidate("now");
+		min_age_ts = approxidate_careful(min_age_str, &min_err);
+		grace_ts = approxidate_careful(grace_str, &grace_err);
+		if (min_err || grace_err) {
+			if (!quiet)
+				fprintf(stderr,
+					_("surface-gc: invalid maintenance.stratified.min-age "
+					  "or grace-period; skipping\n"));
+			ret = 0;
+			goto out;
+		}
+
+		/*
+		 * Clamp so a value resolving to the future cannot underflow
+		 * the unsigned subtraction into a far-past cutoff that would
+		 * wrongly report "caught up".
+		 */
+		grace_offset = now_ts > grace_ts ? now_ts - grace_ts : 0;
+		cutoff_ts = min_age_ts > grace_offset ?
+			min_age_ts - grace_offset : 0;
+	}
+
+	for (i = 0; i < anchors.nr; i++) {
+		const char *anchor_ref = anchors.items[i].string;
+		struct packed_git *p;
+		struct object_id *best_oid = NULL;
+		uint32_t best_ts = 0;
+		struct commit *commit;
+
+		/* Find the most recent stratified commit for this anchor */
+		repo_for_each_pack(r, p) {
+			struct base_stratum_data adata = { 0 };
+
+			if (!p->in_base_stratum)
+				continue;
+			if (load_pack_base_stratum(p, &adata))
+				continue;
+			if (!adata.anchor_ref ||
+			    strcmp(adata.anchor_ref, anchor_ref)) {
+				clear_base_stratum_data(&adata);
+				continue;
+			}
+			if (adata.anchors.nr &&
+			    adata.stratified_timestamp > best_ts) {
+				free(best_oid);
+				best_oid = xmalloc(sizeof(*best_oid));
+				oidcpy(best_oid, &adata.anchors.oid[0]);
+				best_ts = adata.stratified_timestamp;
+			}
+			clear_base_stratum_data(&adata);
+		}
+
+		if (!best_oid) {
+			if (!quiet)
+				fprintf(stderr,
+					_("surface-gc: anchor '%s' has no stratified commits yet\n"),
+					anchor_ref);
+			ret = 0;
+			goto out;
+		}
+
+		commit = lookup_commit(r, best_oid);
+		free(best_oid);
+
+		if (!commit || repo_parse_commit(r, commit)) {
+			if (!quiet)
+				fprintf(stderr,
+					_("surface-gc: cannot parse stratified commit for '%s'\n"),
+					anchor_ref);
+			ret = 0;
+			goto out;
+		}
+
+		if (commit->date < cutoff_ts) {
+			if (!quiet)
+				fprintf(stderr,
+					_("surface-gc: skipped, stratifying for '%s' is lagging "
+				  "(stratified up to %s [%s], need commits newer than "
+				  "stratify.min-age(%s) + surface-gc.grace-period(%s))\n"),
+				anchor_ref,
+				oid_to_hex(&commit->object.oid),
+				show_date(commit->date, 0, DATE_MODE(SHORT)),
+				min_age_str, grace_str);
+			ret = 0;
+			goto out;
+		}
+	}
+
+out:
+	string_list_clear(&anchors, 0);
+	return ret;
+}
+
 static int maintenance_task_surface_gc(struct maintenance_run_opts *opts,
 				      struct gc_config *cfg UNUSED)
 {
@@ -2461,6 +2594,15 @@ static int maintenance_task_surface_gc(struct maintenance_run_opts *opts,
 				       &expiration))
 		repo_config_get_string_tmp(r, "gc.pruneexpire",
 					   &expiration);
+
+	/*
+	 * Check if stratify stratifying has caught up enough for
+	 * surface-gc to be effective. If stratifying is lagging behind,
+	 * the active stratum is still too large and surface-gc
+	 * would be as expensive as a full repack.
+	 */
+	if (!stratify_stratifying_caught_up(r, opts->quiet))
+		return 0;
 
 	child.git_cmd = 1;
 	strvec_pushl(&child.args, "repack", "-d", "-l", "--cruft", NULL);
