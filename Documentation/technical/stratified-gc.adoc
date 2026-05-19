@@ -100,16 +100,32 @@ The `stratify` task incrementally stratifies objects from regular packs into
 base-stratum packs. For each configured anchor ref, the task:
 
 1. Resolves the ref to a commit.
-2. Finds the last-stratified commit from existing `.base-stratum` files for that ref.
-3. Runs `git rev-list --objects --reverse --before=<min-age> <tip> [^<last_stratified>]`
-   to enumerate unstratified reachable objects.
+2. Computes the maximal antichain of stratified frontier commits from existing
+   `.base-stratum` files for that ref — each element is an `anchor_commit` that
+   is an ancestor of the tip and is not an ancestor of any other element.
+   Linear histories collapse the antichain to one element; merge histories
+   stratified across multiple batches can carry several sibling frontiers
+   simultaneously.
+3. Runs `git rev-list --objects --in-commit-order --reverse --before=<min-age> <tip> [^<frontier_1> ^<frontier_2>...]`
+   to enumerate unstratified reachable objects, with one `^` bound per
+   antichain element.
 4. Feeds the object list to `git pack-objects` to create a new base-stratum pack.
 5. Writes the `.base-stratum` sidecar, recording the last commit in the output
    as the anchor commit (not the ref tip).
 
-The incremental walk bounded by `^<last_stratified>` means subsequent runs only
-process objects newer than what was previously stratified. The walk cost is
-proportional to the new objects, not the entire history.
+The incremental walk bounded by the frontier antichain means subsequent runs
+avoid walking history already covered by this anchor's base-stratum packs.
+The remaining walk is scoped to objects outside the frontier, and when
+`maintenance.stratified.batch-size` is set the rev-list walk itself is
+stopped at the first commit boundary past the batch limit — the parent
+streams rev-list's output into pack-objects one commit at a time and
+closes the read end once the batch is satisfied. The parent buffers one
+commit group at a time, so memory is bounded by the largest included
+commit group rather than by the full eligible remainder. Passing the full
+antichain — rather than picking one element — is what lets stratify advance
+cleanly through merges when `maintenance.stratified.batch-size` stratifies
+the two sides of a merge in separate runs; the antichain collapses to a
+single element once the merge commit itself is stratified.
 
 Batch size control
 ~~~~~~~~~~~~~~~~~~
@@ -120,8 +136,8 @@ objects come first, so truncation stratifies the oldest batch and defers newer
 objects to subsequent runs.
 
 The `.base-stratum` sidecar records the last commit actually included in the
-batch (not the ref tip), so the next run's `^<last_stratified>` exclusion
-correctly continues from where the previous batch ended.
+batch (not the ref tip), so the next run's `^<frontier>` exclusions correctly
+continue from where each previous batch ended.
 
 This is important for the sliding time window: even without batch truncation,
 the anchor commit is always the last commit from the `--before=<min-age>`
@@ -158,10 +174,10 @@ skew, manual sidecar edits, or future timestamp-inheriting code paths
 can break).
 
 After demotion, the stratify task re-stratifies from scratch on the
-next run. `find_stratified_ancestor()` consults this anchor's own
-base-stratum packs (if any survived the validation pass) for a `^bound`
-on the rev-list, so the walk only repeats the prefix that lost its
-pack.
+next run. `find_stratified_frontier()` consults this anchor's own
+base-stratum packs (if any survived the validation pass) to build the
+maximal antichain of `^bound`s for the rev-list, so the walk only
+repeats the prefix that lost its pack.
 
 This is cheap: one ancestor check per base-stratum pack via
 `repo_in_merge_bases()`, accelerated to near-constant time by the
@@ -171,11 +187,10 @@ Self-contained anchor coverage and anchor retirement
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 The union of an anchor's own base-stratum packs covers every object
-reachable from its `anchor_commit` down to the min-age window. The
-`^<last_stratified>` exclusion bounds the *new* walk on subsequent
-runs, but it never excludes an object from one of this anchor's
-packs unless an earlier pack of the *same anchor* already contains
-it.
+reachable from its frontier antichain down to the min-age window. The
+`^<frontier>` exclusions bound the *new* walk on subsequent runs, but
+they never exclude an object from one of this anchor's packs unless an
+earlier pack of the *same anchor* already contains it.
 
 Cross-anchor sharing is not used. Two anchors that share history
 will duplicate the shared prefix across their packs — the design
@@ -220,16 +235,29 @@ Readiness check
 ~~~~~~~~~~~~~~~
 
 Before running, surface-gc verifies that stratify stratifying has caught up
-sufficiently. For each configured anchor ref, the commit date of the
-last-stratified commit must be newer than the combined threshold of
-`maintenance.stratified.min-age` plus `maintenance.stratified.grace-period`
-(default: `1.week.ago`).
+sufficiently. For each configured anchor ref, the cutoff is the combined
+threshold of `maintenance.stratified.min-age` plus
+`maintenance.stratified.grace-period` (default: `1.week.ago`).
 
-If any anchor's stratifying frontier is older than this cutoff, surface-gc is
-skipped. The active stratum would still be too large for surface-gc to
-save meaningful work over a full repack. This is particularly relevant
-when `batch-size` is set and stratify needs multiple runs to fully pin
-an anchor's history.
+Readiness is a graph query, not a date comparison:
+
+....
+  git rev-list --max-count=1 --before=<cutoff> <tip> \
+      ^<frontier_1> ^<frontier_2>...
+....
+
+The anchor is ready iff this returns no commit — i.e. every commit older
+than the cutoff is reachable from some element of the stratified frontier
+antichain. If any commit older than the cutoff remains outside the
+frontier, surface-gc is skipped: the active stratum would still be too
+large for surface-gc to save meaningful work over a full repack.
+
+This matters when `batch-size` is set and stratify needs multiple runs to
+fully pin an anchor's history, and especially when the antichain has
+multiple elements (a merge whose two sides have been stratified but whose
+merge commit has not): a single max(date) over the antichain would
+incorrectly declare the anchor caught up while old commits remain in the
+active stratum.
 
 Why surface-gc is cheap
 ~~~~~~~~~~~~~~~~~~~~~~

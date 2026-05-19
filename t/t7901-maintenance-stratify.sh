@@ -112,13 +112,16 @@ sidecar_for_ref () {
 	done
 }
 
-# Configure two anchors that point at different commits, so OID-level
-# dedup does not collapse them into one pack. Used by orphan/prune tests
-# that need each anchor to have its own sidecar.
+# Configure two anchors that point at sibling commits — they share a
+# common base (c1) but each has its own unique commit beyond it. Each
+# pack is self-contained and includes the shared c1 base independently.
 setup_two_distinct_anchors () {
 	test_commit --no-tag c1 &&
 	git branch release HEAD &&
 	test_commit --no-tag c2 &&
+	git checkout -q release &&
+	test_commit --no-tag r1 &&
+	git checkout -q master &&
 
 	git config --add maintenance.stratified.anchor refs/heads/master &&
 	git config --add maintenance.stratified.anchor refs/heads/release
@@ -165,16 +168,58 @@ test_expect_success 'two anchors at same commit get distinct packs' '
 		git config --add maintenance.stratified.anchor refs/heads/master &&
 		git config --add maintenance.stratified.anchor refs/heads/release &&
 
-		git maintenance run --task=stratify --quiet &&
+		git maintenance run --task=stratify --no-quiet &&
 
+		# Two sidecars and two packs, one per anchor. Each
+		# sidecar records a different anchor_ref; if the packs
+		# collided on the same path, the second write would have
+		# overwritten the first sidecar, leaving only one.
 		test 2 -eq $(count_sidecars) &&
-
-		# Each sidecar must record a different anchor_ref. If the
-		# packs collided on the same path, the second write would
-		# have overwritten the first sidecar, leaving only one.
+		test 2 -eq $(count_packs) &&
 		extract_sidecar_refs >actual &&
 		printf "refs/heads/master\nrefs/heads/release\n" >expect &&
-		test_cmp expect actual
+		test_cmp expect actual &&
+
+		# Surface-gc readiness recognizes each anchor from its
+		# own pack — no cross-anchor frontier lookup is needed.
+		git config maintenance.stratified.min-age "now" &&
+		git config maintenance.stratified.grace-period "now" &&
+		git maintenance run --task=surface-gc --no-quiet 2>err &&
+		! grep "no stratified commits yet" err
+	)
+'
+
+test_expect_success 'each anchor gets a self-contained pack even with shared history' '
+	test_create_repo shared-history-anchors &&
+	(
+		cd shared-history-anchors &&
+
+		# release is a strict ancestor of master: release at c1,
+		# master at c2 (child of c1). Each anchor produces its
+		# own pack and the shared c1 objects appear in both
+		# packs — no cross-anchor filtering.
+		test_commit --no-tag c1 &&
+		git branch release HEAD &&
+		test_commit --no-tag c2 &&
+
+		git config --add maintenance.stratified.anchor refs/heads/master &&
+		git config --add maintenance.stratified.anchor refs/heads/release &&
+
+		git maintenance run --task=stratify --no-quiet &&
+
+		# Two sidecars and two packs, one per anchor.
+		test 2 -eq $(count_sidecars) &&
+		test 2 -eq $(count_packs) &&
+		extract_sidecar_refs >actual &&
+		printf "refs/heads/master\nrefs/heads/release\n" >expect &&
+		test_cmp expect actual &&
+
+		# Surface-gc readiness recognizes each anchor from its
+		# own pack — no cross-anchor frontier lookup is needed.
+		git config maintenance.stratified.min-age "now" &&
+		git config maintenance.stratified.grace-period "now" &&
+		git maintenance run --task=surface-gc --no-quiet 2>err &&
+		! grep "no stratified commits yet" err
 	)
 '
 
@@ -199,6 +244,53 @@ test_expect_success 'second stratify run preserves both anchors sidecars' '
 		git maintenance run --task=stratify --quiet &&
 		test 2 -eq $(count_sidecars) &&
 		test 2 -eq $(count_packs)
+	)
+'
+
+test_expect_success 'annotated-tag anchor: incremental detection and surface-gc gating' '
+	test_create_repo annotated-tag-anchor &&
+	(
+		cd annotated-tag-anchor &&
+		test_commit --no-tag c1 &&
+		git tag -a -m "release v1" v1 &&
+
+		# Sanity-check: the tag must be annotated, otherwise
+		# refs/tags/v1 resolves directly to the commit and the
+		# bug under test cannot manifest.
+		tag_oid=$(git rev-parse refs/tags/v1) &&
+		commit_oid=$(git rev-parse refs/tags/v1^{commit}) &&
+		test "$tag_oid" != "$commit_oid" &&
+
+		git config --add maintenance.stratified.anchor refs/tags/v1 &&
+		git maintenance run --task=stratify --quiet &&
+		test 1 -eq $(count_sidecars) &&
+
+		# The sidecar records the peeled commit OID, not the tag
+		# object OID; rev-list emits commits, and the stratify
+		# task picks the last fully-included commit as the anchor.
+		sc=$(ls .git/objects/pack/*.base-stratum) &&
+		extract_sidecar_anchor "$sc" >actual &&
+		echo "$commit_oid" >expect &&
+		test_cmp expect actual &&
+
+		# A second stratify run with no new commits must be a
+		# no-op. find_stratified_ancestor() peels tip_oid through
+		# the tag to find last_stratified=commit_oid; without
+		# peeling, lookup_commit() rejects the tag OID, the
+		# helper returns NULL, and rev-list re-walks all history
+		# and writes a second pack.
+		git maintenance run --task=stratify --quiet &&
+		test 1 -eq $(count_sidecars) &&
+		test 1 -eq $(count_packs) &&
+
+		# surface-gc readiness: stratified_frontier_date() must
+		# also peel the tag, otherwise it reports "no stratified
+		# commits yet" and surface-gc skips indefinitely on
+		# tag-anchored repos.
+		git config maintenance.stratified.min-age "now" &&
+		git config maintenance.stratified.grace-period "now" &&
+		git maintenance run --task=surface-gc --no-quiet 2>err &&
+		! grep "no stratified commits yet" err
 	)
 '
 
@@ -593,6 +685,144 @@ test_expect_success 'consolidate-stratum merges packs into a multi-anchor union'
 		git maintenance run --task=stratify --no-quiet 2>err &&
 		test_grep "already fully stratified" err &&
 		! grep "skipped.*already in base-stratum" err
+	)
+'
+
+test_expect_success 'surface-gc readiness uses graph query, not max(date) on antichain' '
+	test_create_repo readiness-graph &&
+	(
+		cd readiness-graph &&
+
+		# Build a merge DAG:
+		#   c1 -> old-left ----> merge -> tip
+		#      \              /
+		#       recent-right -
+		#
+		# c1, old-left, merge, tip have very old committer dates;
+		# recent-right is dated 1 hour ago. With
+		# min-age=30.minutes.ago and grace-period=1.day.ago the
+		# surface-gc cutoff is roughly 24.5 hours ago — recent-right
+		# is far newer than the cutoff but still older than min-age,
+		# so stratify will pack it and a max(date)-based readiness
+		# check would treat the anchor as caught up even on a slow
+		# CI machine.
+		#
+		# After three batch-size=1 stratify runs the antichain
+		# frontier is {old-left, recent-right}. The merge commit
+		# is still in the active stratum and is older than the
+		# cutoff. A max(date)-based readiness check would have
+		# seen recent-right (newer than cutoff) and wrongly
+		# declared "caught up"; the graph query finds the old
+		# merge commit reachable from tip without going through
+		# any antichain element and reports "lagging".
+		now=$(date +%s) &&
+		old="@1 +0000" &&
+		recent="@$((now - 3600)) +0000" &&
+
+		test_commit --no-tag --date "$old" c1 &&
+		test_commit --no-tag --date "$old" old-left &&
+		git branch right HEAD~1 &&
+		git checkout -q right &&
+		test_commit --no-tag --date "$recent" recent-right &&
+		git checkout -q master &&
+		GIT_AUTHOR_DATE="$old" GIT_COMMITTER_DATE="$old" \
+			git merge --no-ff -m merge right &&
+		test_commit --no-tag --date "$old" tip &&
+
+		git config --add maintenance.stratified.anchor refs/heads/master &&
+		git config maintenance.stratified.batch-size 1 &&
+		git config maintenance.stratified.min-age "30.minutes.ago" &&
+		git config maintenance.stratified.grace-period "1.day.ago" &&
+
+		for i in 1 2 3
+		do
+			git maintenance run --task=stratify --quiet || return 1
+		done &&
+		test 3 -eq $(count_sidecars) &&
+
+		git maintenance run --task=surface-gc --no-quiet 2>err &&
+		test_grep "is lagging" err &&
+		test_grep "old commits remain outside the frontier" err
+	)
+'
+
+test_expect_success 'stratify does not strand fork siblings behind a recent merge' '
+	test_create_repo fork-no-strand &&
+	(
+		cd fork-no-strand &&
+
+		# Old fork joined by a merge that is too recent to stratify:
+		#
+		#   c1 -> left1 -> left2 -> left3 --\
+		#     \                              merge   (recent, master tip)
+		#      -> right1 -> right2 -> right3 /
+		#
+		# c1 and the branch commits use the incrementing test_tick dates
+		# (years old, so older than min-age and eligible); the merge is
+		# dated "now" (newer than min-age, so never stratified). The
+		# merge is the only common descendant of the two branches, so
+		# while it stays outside the walk the eligible frontier can only
+		# ever be the antichain {left3, right3}: it never collapses to a
+		# single commit.
+		#
+		# A run that recorded a single anchor covering objects from both
+		# branches would strand one branch: ^frontier could not exclude
+		# it, so its objects would be re-walked and re-filtered on every
+		# later run, and surface-gc would lag forever. Instead the pack
+		# records the whole maximal antichain of fully-included commits,
+		# {left3, right3}, so a single base-stratum pack covers the entire
+		# old fork and the next run excludes both branches with nothing
+		# re-walked.
+		test_commit --no-tag c1 &&
+		git branch right &&
+		test_commit --no-tag left1 &&
+		test_commit --no-tag left2 &&
+		test_commit --no-tag left3 &&
+		left3=$(git rev-parse HEAD) &&
+		git checkout -q right &&
+		test_commit --no-tag right1 &&
+		test_commit --no-tag right2 &&
+		test_commit --no-tag right3 &&
+		right3=$(git rev-parse HEAD) &&
+		git checkout -q master &&
+
+		# The merge must keep a recent committer date; do not route it
+		# through test_commit, whose test_tick would reset the date back
+		# into the eligible (old) range.
+		now=$(date +%s) &&
+		recent="@$now +0000" &&
+		GIT_AUTHOR_DATE="$recent" GIT_COMMITTER_DATE="$recent" \
+			git merge --no-ff -m merge right &&
+
+		git config --add maintenance.stratified.anchor refs/heads/master &&
+
+		# A single run packs the entire old fork into ONE pack and
+		# records both eligible branch tips as anchors -- no batch-size
+		# is set, so the whole eligible frontier is covered at once. An
+		# implementation that stopped at the first fork boundary would
+		# have needed many runs (one commit per fork commit), and
+		# recording a single anchor would have stranded a branch
+		# entirely.
+		git maintenance run --task=stratify --no-quiet 2>err &&
+		test 1 -eq $(count_sidecars) &&
+		sc=$(ls .git/objects/pack/*.base-stratum) &&
+		test 2 -eq $(extract_sidecar_anchor_count "$sc") &&
+		extract_sidecar_anchor "$sc" >actual &&
+		printf "%s\n%s\n" "$left3" "$right3" | sort >expect &&
+		test_cmp expect actual &&
+		! grep "skipped.*already in base-stratum" err &&
+
+		# A further run is a clean no-op: fully stratified, nothing
+		# re-walked, nothing skipped.
+		git maintenance run --task=stratify --no-quiet 2>err2 &&
+		test_grep "already fully stratified" err2 &&
+		! grep "skipped.*already in base-stratum" err2 &&
+
+		# With the old fork fully stratified and only the recent merge
+		# outside the frontier, surface-gc is caught up rather than
+		# permanently lagging.
+		git maintenance run --task=surface-gc --no-quiet 2>sgc_err &&
+		! grep "is lagging" sgc_err
 	)
 '
 

@@ -182,11 +182,11 @@ maintenance.stratified.cruft-expiration::
 
 maintenance.stratified.grace-period::
 	An approxidate string controlling how far behind stratify stratifying
-	can lag before `surface-gc` skips its run. The task checks that each
-	anchor ref's last-stratified commit date is newer than the combined
-	threshold of `maintenance.stratified.min-age` plus this grace period.
-	If any anchor's stratifying frontier is older than this cutoff, surface-gc
-	is skipped. Defaults to `1.week.ago`.
+	can lag before `surface-gc` skips its run. The cutoff is
+	`maintenance.stratified.min-age` plus this grace period; the task asks
+	whether any commit older than the cutoff is still reachable from each
+	anchor ref's tip after excluding its stratified frontier antichain. If
+	such a commit exists, surface-gc is skipped. Defaults to `1.week.ago`.
 
 maintenance.consolidate-stratum.auto::
 	This integer config option controls how often the `consolidate-stratum`

@@ -29,6 +29,7 @@
 #include "commit.h"
 #include "commit-graph.h"
 #include "commit-reach.h"
+#include "odb/source-files.h"
 #include "oid-array.h"
 #include "pack-base-stratum.h"
 #include "packfile.h"
@@ -2214,6 +2215,92 @@ static ssize_t feed_pack_objects(int fd, const void *buf, size_t len)
 }
 
 /*
+ * Result of the per-anchor readiness query.
+ */
+enum stratify_caught_up {
+	STRATIFY_CAUGHT_UP = 0,        /* no eligible commits left outside the frontier */
+	STRATIFY_LAGGING,              /* at least one commit older than cutoff is outside the frontier */
+	STRATIFY_NO_FRONTIER,          /* anchor has no base-stratum pack yet */
+	STRATIFY_CAUGHT_UP_ERROR,      /* rev-list failed; treat as lagging (fail closed) */
+};
+
+/*
+ * Ask the graph: is there any commit older than `cutoff_ts` that is
+ * reachable from `tip_oid` but not from any element of `anchor_ref`'s
+ * maximal stratified frontier antichain?
+ *
+ * This is the correct readiness signal for surface-gc. The previous
+ * implementation returned max(anchor_commit->date) across the
+ * frontier and let the caller compare against the cutoff; that's a
+ * false positive when one frontier branch is recent but another path
+ * from tip still has old eligible commits outside any frontier — e.g.
+ * a merge whose old-dated sibling has been stratified, whose
+ * recent-dated sibling has been stratified, but whose old-dated
+ * merge commit itself has not.
+ *
+ *	git rev-list --max-count=1 --before=<cutoff> <tip> [^<frontier>...]
+ *
+ * If that yields a commit, stratify is still lagging for this anchor.
+ * If it yields nothing, there are no old eligible commits left
+ * outside the base-stratum frontier, so surface-gc is caught up.
+ *
+ * The lookup is per-anchor: base-stratum coverage is anchor-scoped,
+ * so an anchor's readiness depends only on its own pack set.
+ */
+static enum stratify_caught_up stratify_anchor_caught_up(struct repository *r,
+							 const char *anchor_ref,
+							 const struct object_id *tip_oid,
+							 timestamp_t cutoff_ts)
+{
+	struct oid_array frontier = OID_ARRAY_INIT;
+	struct child_process rev_list = CHILD_PROCESS_INIT;
+	struct strbuf out = STRBUF_INIT;
+	enum stratify_caught_up result;
+	size_t i;
+
+	find_stratified_frontier(r, anchor_ref, tip_oid, &frontier);
+
+	if (!frontier.nr) {
+		oid_array_clear(&frontier);
+		return STRATIFY_NO_FRONTIER;
+	}
+
+	rev_list.git_cmd = 1;
+	strvec_pushl(&rev_list.args, "rev-list", "--max-count=1", NULL);
+	strvec_pushf(&rev_list.args, "--before=%"PRItime, cutoff_ts);
+	strvec_push(&rev_list.args, oid_to_hex(tip_oid));
+	for (i = 0; i < frontier.nr; i++)
+		strvec_pushf(&rev_list.args, "^%s",
+			     oid_to_hex(&frontier.oid[i]));
+
+	rev_list.out = -1;
+	if (start_command(&rev_list)) {
+		oid_array_clear(&frontier);
+		return STRATIFY_CAUGHT_UP_ERROR;
+	}
+	if (strbuf_read(&out, rev_list.out, 0) < 0) {
+		close(rev_list.out);
+		finish_command(&rev_list);
+		strbuf_release(&out);
+		oid_array_clear(&frontier);
+		return STRATIFY_CAUGHT_UP_ERROR;
+	}
+	close(rev_list.out);
+	if (finish_command(&rev_list)) {
+		strbuf_release(&out);
+		oid_array_clear(&frontier);
+		return STRATIFY_CAUGHT_UP_ERROR;
+	}
+
+	strbuf_trim(&out);
+	result = out.len ? STRATIFY_LAGGING : STRATIFY_CAUGHT_UP;
+
+	strbuf_release(&out);
+	oid_array_clear(&frontier);
+	return result;
+}
+
+/*
  * Build the set of base-stratum packs recorded for `anchor_ref`. The
  * `^<frontier>...` bounds on rev-list usually keep already-packed objects
  * out of the input, but those bounds are at commit granularity; the
@@ -2887,7 +2974,20 @@ static int maintenance_task_stratify(struct maintenance_run_opts *opts,
 		}
 		pack_path = xstrfmt("%s.idx", pack_prefix);
 
-		new_pack = add_packed_git(r, pack_path, strlen(pack_path), 1);
+		/*
+		 * Register the new pack with the in-memory packfile store
+		 * so that the helpers we call below see it via
+		 * repo_for_each_pack — write_pack_base_stratum() flips
+		 * new_pack->in_base_stratum and any subsequent lookup of
+		 * base-stratum coverage in this same process needs to find
+		 * the pack on the store.
+		 */
+		{
+			struct odb_source_files *files =
+				odb_source_files_downcast(r->objects->sources);
+			new_pack = packfile_store_load_pack(files->packed,
+							    pack_path, 1);
+		}
 		if (new_pack) {
 			if (write_pack_base_stratum(new_pack, &recorded_anchors,
 						    anchor_ref,
@@ -3222,7 +3322,12 @@ static int maintenance_task_consolidate_stratum(
 			free(full_prefix);
 		}
 		pack_path = xstrfmt("%s.idx", pack_prefix);
-		new_pack = add_packed_git(r, pack_path, strlen(pack_path), 1);
+		{
+			struct odb_source_files *files =
+				odb_source_files_downcast(r->objects->sources);
+			new_pack = packfile_store_load_pack(files->packed,
+							    pack_path, 1);
+		}
 		free(pack_path);
 		free(pack_prefix);
 		strbuf_release(&pack_hash);
@@ -3552,6 +3657,15 @@ static int maintenance_task_stratify_prune(struct maintenance_run_opts *opts,
 	 */
 	collect_base_stratum_pack_groups(r, &ref_groups, NULL);
 
+	/*
+	 * Base-stratum coverage is anchor-scoped: an anchor's pack set
+	 * together carries every object reachable from its anchor down to
+	 * the min-age window. Demoting an orphan unlinks its .base-stratum
+	 * and .keep sidecars; the .pack itself stays on disk and the next
+	 * geometric repack folds it into the active stratum. Surviving
+	 * packs cannot lose coverage because coverage is never shared
+	 * across anchors.
+	 */
 	for (i = 0; i < ref_groups.nr; i++) {
 		struct base_stratum_pack_group *group = ref_groups.items[i].util;
 		const char *anchor = ref_groups.items[i].string;
@@ -3562,12 +3676,13 @@ static int maintenance_task_stratify_prune(struct maintenance_run_opts *opts,
 
 		trace2_region_enter("stratify-prune", anchor, r);
 		for (j = 0; j < group->nr; j++) {
+			struct base_stratum_pack_entry *entry = &group->entries[j];
+
 			if (!opts->quiet)
 				fprintf(stderr,
 					_("stratify-prune: demoting %s "
 					  "(anchor '%s' no longer configured)\n"),
-					pack_basename(group->entries[j].pack),
-					anchor);
+					pack_basename(entry->pack), anchor);
 			/*
 			 * remove_pack_base_stratum() reports failure when it
 			 * cannot unlink the .base-stratum or .keep sidecar. A
@@ -3577,7 +3692,7 @@ static int maintenance_task_stratify_prune(struct maintenance_run_opts *opts,
 			 * was not demoted, so do not count it and surface the
 			 * failure rather than reporting a phantom cleanup.
 			 */
-			if (remove_pack_base_stratum(group->entries[j].pack)) {
+			if (remove_pack_base_stratum(entry->pack)) {
 				failed++;
 				continue;
 			}
@@ -3678,10 +3793,12 @@ static int consolidate_stratum_auto_condition(struct gc_config *cfg UNUSED)
  */
 /*
  * Check whether stratify stratifying has caught up sufficiently for
- * surface-gc to be worthwhile. For each anchor ref, compare the
- * commit date of the last-stratified commit against (now - min-age - grace).
- * If stratifying is lagging behind by more than the grace period, the
- * active stratum is still too large for surface-gc to save work.
+ * surface-gc to be worthwhile. For each anchor ref, ask whether any
+ * commit older than (now - min-age - grace) is still reachable from
+ * the tip after excluding the anchor's stratified frontier antichain
+ * (see stratify_anchor_caught_up()). If such a commit exists,
+ * stratify is still lagging and surface-gc is skipped — the active
+ * stratum is too large for the cruft repack to save work.
  */
 static int stratify_stratifying_caught_up(struct repository *r, int quiet)
 {
@@ -3740,65 +3857,57 @@ static int stratify_stratifying_caught_up(struct repository *r, int quiet)
 
 	for (i = 0; i < anchors.nr; i++) {
 		const char *anchor_ref = anchors.items[i].string;
-		struct packed_git *p;
-		struct object_id *best_oid = NULL;
-		uint32_t best_ts = 0;
-		struct commit *commit;
+		struct object_id tip_oid;
+		enum stratify_caught_up status;
 
-		/* Find the most recent stratified commit for this anchor */
-		repo_for_each_pack(r, p) {
-			struct base_stratum_data adata = { 0 };
-
-			if (!p->in_base_stratum)
-				continue;
-			if (load_pack_base_stratum(p, &adata))
-				continue;
-			if (!adata.anchor_ref ||
-			    strcmp(adata.anchor_ref, anchor_ref)) {
-				clear_base_stratum_data(&adata);
-				continue;
-			}
-			if (adata.anchors.nr &&
-			    adata.stratified_timestamp > best_ts) {
-				free(best_oid);
-				best_oid = xmalloc(sizeof(*best_oid));
-				oidcpy(best_oid, &adata.anchors.oid[0]);
-				best_ts = adata.stratified_timestamp;
-			}
-			clear_base_stratum_data(&adata);
+		if (!refs_resolve_ref_unsafe(get_main_ref_store(r),
+					     anchor_ref,
+					     RESOLVE_REF_READING,
+					     &tip_oid, NULL)) {
+			if (!quiet)
+				fprintf(stderr,
+					_("surface-gc: cannot resolve anchor '%s'\n"),
+					anchor_ref);
+			ret = 0;
+			goto out;
 		}
 
-		if (!best_oid) {
+		/*
+		 * Per-anchor readiness: ask the graph whether any
+		 * commit older than the cutoff is still reachable
+		 * from the tip without going through the stratified
+		 * frontier antichain. Other anchors' packs do not
+		 * contribute coverage — base-stratum coverage is
+		 * anchor-scoped.
+		 */
+		status = stratify_anchor_caught_up(r, anchor_ref, &tip_oid,
+						   cutoff_ts);
+
+		switch (status) {
+		case STRATIFY_CAUGHT_UP:
+			break;
+		case STRATIFY_NO_FRONTIER:
 			if (!quiet)
 				fprintf(stderr,
 					_("surface-gc: anchor '%s' has no stratified commits yet\n"),
 					anchor_ref);
 			ret = 0;
 			goto out;
-		}
-
-		commit = lookup_commit(r, best_oid);
-		free(best_oid);
-
-		if (!commit || repo_parse_commit(r, commit)) {
-			if (!quiet)
-				fprintf(stderr,
-					_("surface-gc: cannot parse stratified commit for '%s'\n"),
-					anchor_ref);
-			ret = 0;
-			goto out;
-		}
-
-		if (commit->date < cutoff_ts) {
+		case STRATIFY_LAGGING:
 			if (!quiet)
 				fprintf(stderr,
 					_("surface-gc: skipped, stratifying for '%s' is lagging "
-				  "(stratified up to %s [%s], need commits newer than "
-				  "stratify.min-age(%s) + surface-gc.grace-period(%s))\n"),
-				anchor_ref,
-				oid_to_hex(&commit->object.oid),
-				show_date(commit->date, 0, DATE_MODE(SHORT)),
-				min_age_str, grace_str);
+					  "(old commits remain outside the frontier; "
+					  "need stratify to advance past maintenance.stratified.min-age(%s) "
+					  "+ maintenance.stratified.grace-period(%s))\n"),
+					anchor_ref, min_age_str, grace_str);
+			ret = 0;
+			goto out;
+		case STRATIFY_CAUGHT_UP_ERROR:
+			if (!quiet)
+				fprintf(stderr,
+					_("surface-gc: readiness check failed for anchor '%s'; skipping\n"),
+					anchor_ref);
 			ret = 0;
 			goto out;
 		}

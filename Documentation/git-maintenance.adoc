@@ -196,8 +196,11 @@ For each ref listed in `maintenance.stratified.anchor`, the task
 resolves the ref, walks its history with `git rev-list --objects`
 (bounded by `maintenance.stratified.min-age`), and packs the
 resulting objects into a base-stratum pack with a `.base-stratum` sidecar
-file. On subsequent runs, only objects newer than the last-stratified
-commit are walked, making the task incremental.
+file. On subsequent runs, the walk is bounded by `^<frontier>` for every
+element of the anchor's maximal stratified frontier antichain — typically
+a single commit on linear history, but a set of sibling commits when
+batching has stratified the two sides of a merge separately — so only
+genuinely new objects are walked.
 +
 The task also validates existing base-stratum packs before creating new
 ones: if an anchor ref has been deleted or force-pushed past the
@@ -255,12 +258,13 @@ surface-gc::
 	repack only cover the active stratum.
 +
 Before running, the task checks that stratify stratifying has caught up
-sufficiently: for each configured anchor ref, the commit date of the
-last-stratified commit must be newer than the combined threshold of
+sufficiently. For each configured anchor ref, the cutoff is
 `maintenance.stratified.min-age` plus
-`maintenance.stratified.grace-period`. If stratifying is lagging behind,
-the task is skipped because the active stratum would still be too
-large for surface-gc to save meaningful work over a full repack.
+`maintenance.stratified.grace-period`; the task asks whether any commit
+older than the cutoff is still reachable from the ref tip after
+excluding its stratified frontier antichain. If such a commit exists,
+the task is skipped because the active stratum would still be too large
+for surface-gc to save meaningful work over a full repack.
 +
 This task is most useful on large repositories where a full `gc` is
 too expensive to run frequently. As stratify progressively stratifies more
