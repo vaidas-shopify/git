@@ -41,6 +41,25 @@ extract_sidecar_refs () {
 	EOF
 }
 
+# Print the anchor_commit OIDs recorded in the sidecar at $1, one per
+# line, sorted. A sidecar records the maximal antichain of fully-included
+# commits, so this is one OID per live branch covered by the pack.
+extract_sidecar_anchor () {
+	perl - "$1" <<-\EOF | sort
+		my $path = $ARGV[0];
+		open my $fh, "<", $path or die "open $path: $!";
+		binmode $fh;
+		my $buf;
+		read $fh, $buf, -s $path;
+		my $hash_id = unpack("N", substr($buf, 8, 4));
+		my $rawsz = ($hash_id == 1) ? 20 : 32;
+		my $count = unpack("N", substr($buf, 12, 4));
+		for my $i (0 .. $count - 1) {
+			print unpack("H*", substr($buf, 16 + $i * $rawsz, $rawsz)), "\n";
+		}
+	EOF
+}
+
 test_expect_success 'two anchors at same commit get distinct packs' '
 	test_create_repo two-anchor-same-commit &&
 	(
@@ -88,6 +107,74 @@ test_expect_success 'second stratify run preserves both anchors sidecars' '
 		git maintenance run --task=stratify --quiet &&
 		test 2 -eq $(count_sidecars) &&
 		test 2 -eq $(count_packs)
+	)
+'
+
+test_expect_success 'batch-size truncation records the last fully-included commit' '
+	test_create_repo batch-truncate-anchor &&
+	(
+		cd batch-truncate-anchor &&
+
+		# Three commits, each adding one new file: 1 commit + 1
+		# root tree + 1 blob = 3 objects per commit, so 9 objects
+		# total. With --in-commit-order, rev-list emits each
+		# commit followed by its trees and blobs.
+		test_commit --no-tag c1 &&
+		test_commit --no-tag c2 &&
+		c2_oid=$(git rev-parse HEAD) &&
+		test_commit --no-tag c3 &&
+
+		git config --add maintenance.stratified.anchor refs/heads/master &&
+
+		# The batch limit is a soft limit checked at commit
+		# boundaries on the count of objects already
+		# flushed. batch-size=4: c1 flushes (3 < 4, keep going),
+		# then c2 flushes (6 >= 4, stop). c1 and c2 land in the
+		# pack and the recorded anchor is c2 -- the last
+		# fully-included commit, which dominates the pack -- so a
+		# follow-up run resumes cleanly from it.
+		git config maintenance.stratified.batch-size 4 &&
+		git maintenance run --task=stratify --quiet &&
+
+		test 1 -eq $(count_sidecars) &&
+		sc=$(ls .git/objects/pack/*.base-stratum) &&
+		extract_sidecar_anchor "$sc" >actual &&
+		echo "$c2_oid" >expect &&
+		test_cmp expect actual &&
+
+		# A follow-up run with no batch limit must pick up where
+		# the previous one left off and stratify the rest. With
+		# the buggy frontier, ^c2 would have permanently hidden
+		# c3 from the next walk.
+		git config --unset maintenance.stratified.batch-size &&
+		git maintenance run --task=stratify --quiet &&
+		test 2 -eq $(count_sidecars)
+	)
+'
+
+test_expect_success 'batch-size smaller than a single commit still makes progress' '
+	test_create_repo batch-single-commit &&
+	(
+		cd batch-single-commit &&
+
+		# A single commit alone produces 3 objects (commit, root
+		# tree, blob); batch-size=2 cannot hold even one commit.
+		# The task must still advance the frontier — silently
+		# emitting an empty batch would mean stratification can
+		# never complete on this repo.
+		test_commit --no-tag c1 &&
+		c1_oid=$(git rev-parse HEAD) &&
+		test_commit --no-tag c2 &&
+
+		git config --add maintenance.stratified.anchor refs/heads/master &&
+		git config maintenance.stratified.batch-size 2 &&
+
+		git maintenance run --task=stratify --quiet &&
+		test 1 -eq $(count_sidecars) &&
+		sc=$(ls .git/objects/pack/*.base-stratum) &&
+		extract_sidecar_anchor "$sc" >actual &&
+		echo "$c1_oid" >expect &&
+		test_cmp expect actual
 	)
 '
 
@@ -159,6 +246,53 @@ test_expect_success 'frontier picks ancestrally-latest, not max committer date' 
 		# path would fire.
 		git maintenance run --task=stratify --no-quiet 2>err &&
 		test_grep "already fully stratified at $c2_oid" err &&
+		! grep "skipped.*objects already in base-stratum" err
+	)
+'
+
+test_expect_success 'stratify advances through a merge using multi-bound frontier' '
+	test_create_repo merge-multi-bound &&
+	(
+		cd merge-multi-bound &&
+
+		# Build a merge history: c1, then sibling branches left
+		# and right1, then a merge commit on master, then c3.
+		# Total stratifiable commits: c1, left, right1, merge, c3.
+		# With batch-size=1, each stratify run packs exactly one
+		# commit, so after stratifying both siblings the frontier
+		# becomes ancestrally incomparable (neither sibling is an
+		# ancestor of the other). The merge commit is reachable
+		# from master but NOT from either sibling alone, so a
+		# single ^bound would cause the rev-list to re-walk the
+		# other sibling. Multi-bound advancement requires passing
+		# all maximal frontier OIDs as ^bounds.
+		test_commit --no-tag c1 &&
+		git branch right HEAD &&
+		test_commit --no-tag left &&
+		git checkout -q right &&
+		test_commit --no-tag right1 &&
+		git checkout -q master &&
+		git merge --no-ff right -m merge &&
+		test_commit --no-tag c3 &&
+
+		git config --add maintenance.stratified.anchor refs/heads/master &&
+		git config maintenance.stratified.batch-size 1 &&
+
+		# Five stratify runs should each pack one commit; if
+		# multi-bound advancement does not work, runs 4 and 5
+		# would either be no-ops or repack already-packed objects.
+		for i in 1 2 3 4 5
+		do
+			git maintenance run --task=stratify --quiet || return 1
+		done &&
+		test 5 -eq $(count_sidecars) &&
+
+		# Sixth run must be a clean no-op: full frontier covers
+		# master, no rev-list work, no "skipped" or "incomparable"
+		# noise.
+		git maintenance run --task=stratify --no-quiet 2>err &&
+		test_grep "already fully stratified" err &&
+		! grep -i "incomparable" err &&
 		! grep "skipped.*objects already in base-stratum" err
 	)
 '

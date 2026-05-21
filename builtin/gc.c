@@ -1917,6 +1917,26 @@ static int load_unique_stratify_anchors(struct repository *r,
 	return 0;
 }
 
+/*
+ * Feed data to a child pack-objects' stdin. pack-objects can exit early
+ * (e.g. disk full or an internal error), leaving us writing to a broken
+ * pipe; the main "git maintenance" process does not otherwise ignore
+ * SIGPIPE, so that write would terminate the whole run instead of letting
+ * us report a per-anchor failure. Ignore SIGPIPE across the write and
+ * return write_in_full()'s result; on failure the caller stops feeding and
+ * falls through to the finish_command() error handling, which reaps the
+ * child and emits the per-anchor warning.
+ */
+static ssize_t feed_pack_objects(int fd, const void *buf, size_t len)
+{
+	ssize_t ret;
+
+	sigchain_push(SIGPIPE, SIG_IGN);
+	ret = write_in_full(fd, buf, len);
+	sigchain_pop(SIGPIPE);
+	return ret;
+}
+
 static int maintenance_task_stratify(struct maintenance_run_opts *opts,
 				       struct gc_config *cfg UNUSED)
 {
@@ -1924,6 +1944,7 @@ static int maintenance_task_stratify(struct maintenance_run_opts *opts,
 	struct string_list anchors = STRING_LIST_INIT_DUP;
 	const char *min_age_str = "2.weeks.ago";
 	timestamp_t min_age_ts;
+	unsigned long batch_size = 0;
 	int result = 0;
 	size_t i;
 
@@ -1941,14 +1962,17 @@ static int maintenance_task_stratify(struct maintenance_run_opts *opts,
 				   &min_age_str);
 	min_age_ts = approxidate(min_age_str);
 
+	repo_config_get_ulong(r, "maintenance.stratified.batch-size",
+			      &batch_size);
+
 	for (i = 0; i < anchors.nr; i++) {
 		const char *anchor_ref = anchors.items[i].string;
 		struct object_id tip_oid;
 		struct oid_array frontier = OID_ARRAY_INIT;
+		struct oid_array recorded_anchors = OID_ARRAY_INIT;
 		size_t fi;
 		struct child_process rev_list = CHILD_PROCESS_INIT;
 		struct child_process pack_proc = CHILD_PROCESS_INIT;
-		struct strbuf rev_list_out = STRBUF_INIT;
 		struct strbuf pack_hash = STRBUF_INIT;
 		struct packed_git *new_pack;
 		char *pack_prefix = NULL;
@@ -1981,10 +2005,23 @@ static int maintenance_task_stratify(struct maintenance_run_opts *opts,
 		 * ref (up to min-age) that are not reachable from any
 		 * already-stratified frontier commit.
 		 *
-		 * git rev-list --objects --before=<min-age> <tip> [^<frontier>...]
+		 * --in-commit-order is required for the batch-size
+		 * truncation below to work: without it, rev-list emits
+		 * all commits first and then all reachable trees and
+		 * blobs, so there are no inline commit boundaries to
+		 * truncate at and the trees/blobs of an included commit
+		 * would be cut off. With it, each commit is followed by
+		 * the trees and blobs reached through that commit, so
+		 * we can truncate at the next commit line and the
+		 * preserved prefix has full object closure for the
+		 * commits it includes.
+		 *
+		 * git rev-list --objects --in-commit-order --reverse \
+		 *	--before=<min-age> <tip> [^<frontier>...]
 		 */
 		rev_list.git_cmd = 1;
-		strvec_pushl(&rev_list.args, "rev-list", "--objects", NULL);
+		strvec_pushl(&rev_list.args, "rev-list", "--objects",
+			     "--in-commit-order", "--reverse", NULL);
 		strvec_pushf(&rev_list.args, "--before=%"PRItime, min_age_ts);
 		strvec_push(&rev_list.args, oid_to_hex(&tip_oid));
 		for (fi = 0; fi < frontier.nr; fi++)
@@ -2004,100 +2041,358 @@ static int maintenance_task_stratify(struct maintenance_run_opts *opts,
 			continue;
 		}
 
-		strbuf_read(&rev_list_out, rev_list.out, 0);
-		close(rev_list.out);
-
-		if (finish_command(&rev_list)) {
-			warning(_("stratify: rev-list failed for '%s'"),
-				anchor_ref);
-			strbuf_release(&rev_list_out);
-			oid_array_clear(&frontier);
-			continue;
-		}
-
-		/* Nothing to stratify */
-		if (!rev_list_out.len) {
-			if (!opts->quiet) {
-				if (frontier.nr == 1)
-					fprintf(stderr,
-						_("stratify: '%s' already fully stratified at %s\n"),
-						anchor_ref,
-						oid_to_hex(&frontier.oid[0]));
-				else if (frontier.nr > 1)
-					fprintf(stderr,
-						_("stratify: '%s' already fully stratified (frontier antichain of %"PRIuMAX" commits)\n"),
-						anchor_ref,
-						(uintmax_t)frontier.nr);
-				else
-					fprintf(stderr,
-						_("stratify: no objects to stratify for '%s' (all newer than min-age)\n"),
-						anchor_ref);
-			}
-			strbuf_release(&rev_list_out);
-			oid_array_clear(&frontier);
-			continue;
-		}
-
 		/*
-		 * Pack the objects. Feed OIDs to pack-objects via stdin.
-		 * rev-list --objects outputs "oid path" lines; pack-objects
-		 * accepts this format.
+		 * Stream rev-list output to pack-objects one commit at a
+		 * time rather than buffering it all in memory. Both
+		 * children stay alive concurrently: rev-list produces,
+		 * we forward each completed commit's lines to
+		 * pack-objects' stdin, and pack-objects drains as we
+		 * feed it. When the batch trips (or a fork opens), close
+		 * rev-list's stdout so it stops on SIGPIPE — batch-size is
+		 * a soft limit: rev-list may run on to the next commit
+		 * boundary before we close the pipe, and the parent's
+		 * per-anchor memory is bounded by the largest single
+		 * commit group (plus pipe and stdio buffering), not by the
+		 * full eligible remainder.
 		 *
-		 * The basename embeds an anchor digest so two anchors whose
-		 * reachable object sets are identical (e.g., two refs at the
-		 * same commit) get distinct pack filenames and do not
-		 * overwrite each other's .base-stratum sidecar.
+		 * --in-commit-order on rev-list groups each commit with
+		 * its reachable trees and blobs, so flushing at commit
+		 * boundaries preserves full object closure for every
+		 * included commit. Truncating mid-commit would leave
+		 * some objects unpacked but advance the frontier past
+		 * the commit, so we drop the partial commit instead.
+		 *
+		 * We only flush (and advance the recorded anchor to) a
+		 * commit that dominates everything walked so far this run.
+		 * --in-commit-order interleaves the branches of an
+		 * un-merged fork, so once a fork opens the in-progress
+		 * commit no longer has a single dominating anchor; we stop
+		 * the run there and leave the sibling commits for a later
+		 * run (where, with one tip already stratified, the other
+		 * branch walks linearly and each commit dominates again).
+		 *
+		 * rev-list --objects format:
+		 *   commits: "<hex>\n"
+		 *   trees/blobs: "<hex> <path>\n"
 		 */
 		{
-			struct strbuf basename = STRBUF_INIT;
-			format_base_stratum_pack_basename(&basename, r,
-							  anchor_ref);
+			FILE *rev_in = xfdopen(rev_list.out, "r");
+			struct strbuf line = STRBUF_INIT;
+			struct strbuf commit_buf = STRBUF_INIT;
+			unsigned long fed_objs = 0;
+			unsigned long cur_commit_objs = 0;
+			int truncated = 0;
+			int pack_feed_failed = 0;
+			int anchor_parse_failed = 0;
+			/*
+			 * Maximal antichain of the commits fully included in
+			 * the pack so far this run. Every commit written to the
+			 * pack is dominated by some element of this set, so the
+			 * antichain is recorded verbatim in the sidecar and
+			 * forms the pack's coverage frontier for the next run.
+			 * Maintained by antichain_add() as each commit is
+			 * flushed; see find_stratified_frontier().
+			 */
+			struct oid_array included = OID_ARRAY_INIT;
+			/*
+			 * pending_anchor tracks the commit currently being
+			 * scanned, only known to be fully included once we
+			 * cross into the next commit (or rev-list output ends).
+			 */
+			struct object_id pending_anchor;
+			int have_pending_anchor = 0;
 
-			pack_proc.git_cmd = 1;
-			strvec_push(&pack_proc.args, "pack-objects");
-			if (opts->quiet)
-				strvec_push(&pack_proc.args, "--quiet");
-			else
-				strvec_push(&pack_proc.args, "--no-quiet");
-			strvec_push(&pack_proc.args, basename.buf);
+			/*
+			 * Peek the first line so we can skip starting
+			 * pack-objects when rev-list has nothing to emit.
+			 */
+			if (strbuf_getline_lf(&line, rev_in) == EOF) {
+				fclose(rev_in);
+				if (finish_command(&rev_list)) {
+					warning(_("stratify: rev-list failed for '%s'"),
+						anchor_ref);
+					result = 1;
+				} else if (!opts->quiet) {
+					if (frontier.nr == 1)
+						fprintf(stderr,
+							_("stratify: '%s' already fully stratified at %s\n"),
+							anchor_ref,
+							oid_to_hex(&frontier.oid[0]));
+					else if (frontier.nr > 1)
+						fprintf(stderr,
+							_("stratify: '%s' already fully stratified (frontier antichain of %"PRIuMAX" commits)\n"),
+							anchor_ref,
+							(uintmax_t)frontier.nr);
+					else
+						fprintf(stderr,
+							_("stratify: no objects to stratify for '%s' (all newer than min-age)\n"),
+							anchor_ref);
+				}
+				strbuf_release(&line);
+				strbuf_release(&commit_buf);
+				oid_array_clear(&included);
+				oid_array_clear(&frontier);
+				continue;
+			}
 
-			pack_prefix = strbuf_detach(&basename, NULL);
-		}
+			/*
+			 * Set up and start pack-objects. With non-empty
+			 * rev-list output we will always have something
+			 * to pack at this point.
+			 */
+			{
+				struct strbuf basename = STRBUF_INIT;
+				format_base_stratum_pack_basename(&basename, r,
+								  anchor_ref);
+				pack_proc.git_cmd = 1;
+				strvec_push(&pack_proc.args, "pack-objects");
+				if (opts->quiet)
+					strvec_push(&pack_proc.args, "--quiet");
+				else
+					strvec_push(&pack_proc.args, "--no-quiet");
+				strvec_push(&pack_proc.args, basename.buf);
+				pack_prefix = strbuf_detach(&basename, NULL);
+			}
+			pack_proc.in = -1;
+			pack_proc.out = -1;
+			if (start_command(&pack_proc)) {
+				warning(_("stratify: failed to start pack-objects for '%s'"),
+					anchor_ref);
+				fclose(rev_in);
+				finish_command(&rev_list);
+				strbuf_release(&line);
+				strbuf_release(&commit_buf);
+				free(pack_prefix);
+				oid_array_clear(&included);
+				oid_array_clear(&frontier);
+				continue;
+			}
 
-		pack_proc.in = -1;
-		pack_proc.out = -1;
+			/*
+			 * Streaming loop. Process the peeked first line,
+			 * then continue reading via do/while so each line
+			 * goes through the same code path. Buffer one
+			 * commit's lines at a time and flush to
+			 * pack-objects' stdin at each commit boundary
+			 * (see below).
+			 */
+			do {
+				int is_commit_line = !memchr(line.buf, ' ', line.len);
 
-		if (start_command(&pack_proc)) {
-			warning(_("stratify: failed to start pack-objects for '%s'"),
-				anchor_ref);
-			strbuf_release(&rev_list_out);
-			free(pack_prefix);
-			oid_array_clear(&frontier);
-			continue;
-		}
+				/*
+				 * A commit line means the previous pending
+				 * commit's closure has now been fully emitted.
+				 * Flush it to pack-objects and add it to the
+				 * coverage antichain.
+				 */
+				if (is_commit_line && have_pending_anchor) {
+					struct commit *pc;
 
-		write_in_full(pack_proc.in, rev_list_out.buf, rev_list_out.len);
-		close(pack_proc.in);
-		strbuf_release(&rev_list_out);
+					if (commit_buf.len &&
+					    feed_pack_objects(pack_proc.in,
+							      commit_buf.buf,
+							      commit_buf.len) < 0) {
+						pack_feed_failed = 1;
+						break;
+					}
+					strbuf_reset(&commit_buf);
+					fed_objs += cur_commit_objs;
+					cur_commit_objs = 0;
 
-		strbuf_read(&pack_hash, pack_proc.out, the_hash_algo->hexsz);
-		close(pack_proc.out);
-		strbuf_trim_trailing_newline(&pack_hash);
+					/*
+					 * Add the just-flushed commit to the
+					 * coverage antichain. A parse failure
+					 * here means rev-list emitted a commit
+					 * we cannot load — we cannot prove the
+					 * pack is closed, so abort this anchor
+					 * without writing a sidecar.
+					 */
+					pc = lookup_commit_reference_gently(
+						r, &pending_anchor, 1);
+					if (!pc || repo_parse_commit(r, pc)) {
+						anchor_parse_failed = 1;
+						break;
+					}
+					antichain_add(r, &included,
+						      &pending_anchor, pc);
 
-		if (finish_command(&pack_proc)) {
-			warning(_("stratify: pack-objects failed for '%s'"),
-				anchor_ref);
-			strbuf_release(&pack_hash);
-			free(pack_prefix);
-			oid_array_clear(&frontier);
-			result = 1;
-			continue;
+					/*
+					 * Soft batch limit: stop once this many
+					 * objects have been flushed. We stop on
+					 * a commit boundary, so the recorded
+					 * antichain dominates the pack and a
+					 * follow-up run resumes from it.
+					 */
+					if (batch_size > 0 && fed_objs >= batch_size) {
+						truncated = 1;
+						break;
+					}
+				}
+
+				if (is_commit_line)
+					have_pending_anchor =
+						!get_oid_hex(line.buf, &pending_anchor);
+
+				strbuf_add(&commit_buf, line.buf, line.len);
+				strbuf_addch(&commit_buf, '\n');
+				cur_commit_objs++;
+			} while (strbuf_getline_lf(&line, rev_in) != EOF);
+
+			/*
+			 * Loop ended at rev-list EOF without stopping early:
+			 * the last pending commit's objects were fully
+			 * consumed, so complete it like any other commit
+			 * boundary and add it to the coverage antichain.
+			 *
+			 * The recorded antichain (not the ref tip) is what the
+			 * sidecar stores. The rev-list is bounded by
+			 * --before=<min-age>, so it represents the actual
+			 * stratified frontier. Using the ref tip would skip
+			 * objects currently newer than min-age but eligible in
+			 * future runs as time passes.
+			 */
+			if (!truncated && !pack_feed_failed && !anchor_parse_failed &&
+			    have_pending_anchor) {
+				if (commit_buf.len &&
+				    feed_pack_objects(pack_proc.in,
+						      commit_buf.buf,
+						      commit_buf.len) < 0)
+					pack_feed_failed = 1;
+				if (!pack_feed_failed) {
+					struct commit *pc;
+
+					fed_objs += cur_commit_objs;
+					cur_commit_objs = 0;
+					pc = lookup_commit_reference_gently(
+						r, &pending_anchor, 1);
+					if (!pc || repo_parse_commit(r, pc))
+						anchor_parse_failed = 1;
+					else
+						antichain_add(r, &included,
+							      &pending_anchor, pc);
+				}
+			}
+
+			fclose(rev_in);          /* closes rev_list.out */
+			close(pack_proc.in);     /* signal EOF to pack-objects */
+			strbuf_read(&pack_hash, pack_proc.out,
+				    the_hash_algo->hexsz);
+			close(pack_proc.out);
+			strbuf_trim_trailing_newline(&pack_hash);
+
+			{
+				int rev_list_rc = finish_command(&rev_list);
+
+				/*
+				 * SIGPIPE (rc 128+13=141) is expected
+				 * when we close rev-list's stdout early
+				 * because the batch tripped or a fork
+				 * opened. Any other non-zero status means
+				 * the walk did not complete; any partial
+				 * output is not a closed set, so we must
+				 * not advance the frontier by writing a
+				 * sidecar from it.
+				 */
+				if (rev_list_rc &&
+				    !((truncated || pack_feed_failed ||
+				       anchor_parse_failed) && rev_list_rc == 141)) {
+					warning(_("stratify: rev-list failed for '%s'"),
+						anchor_ref);
+					finish_command(&pack_proc);
+					strbuf_release(&pack_hash);
+					strbuf_release(&line);
+					strbuf_release(&commit_buf);
+					free(pack_prefix);
+					oid_array_clear(&included);
+					oid_array_clear(&frontier);
+					oid_array_clear(&recorded_anchors);
+					result = 1;
+					continue;
+				}
+			}
+
+			if (finish_command(&pack_proc)) {
+				warning(_("stratify: pack-objects failed for '%s'"),
+					anchor_ref);
+				strbuf_release(&pack_hash);
+				strbuf_release(&line);
+				strbuf_release(&commit_buf);
+				free(pack_prefix);
+				oid_array_clear(&included);
+				oid_array_clear(&frontier);
+				oid_array_clear(&recorded_anchors);
+				result = 1;
+				continue;
+			}
+
+			/*
+			 * A commit emitted by rev-list could not be parsed, so
+			 * we cannot prove the pack is a closed set: discard it
+			 * (leave the orphan pack for a later gc to reclaim) and
+			 * do not record a sidecar.
+			 */
+			if (anchor_parse_failed) {
+				warning(_("stratify: could not parse a stratified "
+					  "commit for '%s'; not recording pack"),
+					anchor_ref);
+				strbuf_release(&pack_hash);
+				strbuf_release(&line);
+				strbuf_release(&commit_buf);
+				free(pack_prefix);
+				oid_array_clear(&included);
+				oid_array_clear(&frontier);
+				oid_array_clear(&recorded_anchors);
+				result = 1;
+				continue;
+			}
+
+			/*
+			 * Copy the coverage antichain out of this block's scope
+			 * so the sidecar write below can record it.
+			 */
+			for (size_t k = 0; k < included.nr; k++)
+				oid_array_append(&recorded_anchors,
+						 &included.oid[k]);
+
+			if (!opts->quiet) {
+				if (truncated)
+					fprintf(stderr,
+						_("stratify: stratified %lu objects (batch limit) for '%s' (%"PRIuMAX" anchor(s))\n"),
+						fed_objs, anchor_ref,
+						(uintmax_t)recorded_anchors.nr);
+				else
+					fprintf(stderr,
+						_("stratify: stratified %lu objects for '%s' (%"PRIuMAX" anchor(s))\n"),
+						fed_objs, anchor_ref,
+						(uintmax_t)recorded_anchors.nr);
+			}
+
+			strbuf_release(&line);
+			strbuf_release(&commit_buf);
+			oid_array_clear(&included);
 		}
 
 		if (!pack_hash.len) {
 			strbuf_release(&pack_hash);
 			free(pack_prefix);
 			oid_array_clear(&frontier);
+			oid_array_clear(&recorded_anchors);
+			continue;
+		}
+
+		/*
+		 * A pack was produced but no anchor was recorded — this should
+		 * not happen (every flushed commit adds to the antichain), but
+		 * a sidecar with no anchors is unusable, so refuse to write one.
+		 */
+		if (!recorded_anchors.nr) {
+			warning(_("stratify: produced a pack with no recorded "
+				  "anchor for '%s'"), anchor_ref);
+			strbuf_release(&pack_hash);
+			free(pack_prefix);
+			oid_array_clear(&frontier);
+			oid_array_clear(&recorded_anchors);
+			result = 1;
 			continue;
 		}
 
@@ -2117,18 +2412,9 @@ static int maintenance_task_stratify(struct maintenance_run_opts *opts,
 
 		new_pack = add_packed_git(r, pack_path, strlen(pack_path), 1);
 		if (new_pack) {
-			struct oid_array recorded_anchors = OID_ARRAY_INIT;
-
-			/*
-			 * This run stratified everything reachable from the
-			 * tip, so the tip is the sole element of the pack's
-			 * coverage antichain.
-			 */
-			oid_array_append(&recorded_anchors, &tip_oid);
 			write_pack_base_stratum(new_pack, &recorded_anchors,
 					    anchor_ref,
 					    (uint32_t)time(NULL));
-			oid_array_clear(&recorded_anchors);
 			new_pack->in_base_stratum = 1;
 		}
 
@@ -2136,6 +2422,7 @@ static int maintenance_task_stratify(struct maintenance_run_opts *opts,
 		free(pack_prefix);
 		strbuf_release(&pack_hash);
 		oid_array_clear(&frontier);
+		oid_array_clear(&recorded_anchors);
 	}
 
 	string_list_clear(&anchors, 0);
