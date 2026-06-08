@@ -259,6 +259,34 @@ merge commit has not): a single max(date) over the antichain would
 incorrectly declare the anchor caught up while old commits remain in the
 active stratum.
 
+Checking stratification status
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The same readiness logic can be queried read-only, without running a repack:
+
+----
+git maintenance run --task=surface-gc --dry-run
+----
+
+For each configured anchor this prints whether stratifying is caught up or
+how far it is lagging, and the verdict surface-gc would reach:
+
+....
+  stratify status (cutoff: min-age 2.weeks.ago, grace-period 1.week.ago)
+    refs/heads/main: lagging by 1240 commits (frontier width 3)
+    refs/heads/release/v1: caught up (frontier width 1)
+  surface-gc would be skipped (refs/heads/main is not caught up)
+....
+
+The *lag distance* is the number of commits older than the cutoff that are
+still reachable from the tip outside the stratified frontier — the same
+`rev-list` the readiness gate runs, but counted in full (`--count`) rather
+than stopped at the first hit. The *frontier width* is the size of the
+maximal antichain recorded across the anchor's `.base-stratum` sidecars (see
+the run-by-run discussion in `stratify-anchor-walk.adoc`). An anchor with no
+base-stratum pack yet reports "no stratified commits yet"; the report never
+modifies the repository.
+
 Why surface-gc is cheap
 ~~~~~~~~~~~~~~~~~~~~~~
 

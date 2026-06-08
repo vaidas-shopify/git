@@ -1377,4 +1377,94 @@ test_expect_success 'standalone consolidate-stratum skips with no configured anc
 	)
 '
 
+test_expect_success 'surface-gc --dry-run reports lagging without modifying the repo' '
+	test_create_repo dry-run-lagging &&
+	(
+		cd dry-run-lagging &&
+
+		test_commit --no-tag c1 &&
+		test_commit --no-tag c2 &&
+		test_commit --no-tag c3 &&
+		test_commit --no-tag c4 &&
+
+		git config --add maintenance.stratified.anchor refs/heads/master &&
+		git config maintenance.stratified.batch-size 1 &&
+
+		# One batch-size=1 run stratifies only the oldest commit, so
+		# old commits remain outside the frontier: lagging.
+		git maintenance run --task=stratify --quiet &&
+		test 1 -eq $(count_sidecars) &&
+
+		ls .git/objects/pack >before &&
+		git maintenance run --task=surface-gc --dry-run >out &&
+		ls .git/objects/pack >after &&
+
+		# The report names the lagging anchor with a lag distance and
+		# frontier width, and concludes surface-gc would be skipped.
+		test_grep "refs/heads/master: lagging by .* commit" out &&
+		test_grep "frontier width" out &&
+		test_grep "surface-gc would be skipped" out &&
+
+		# A dry run must never touch the object store.
+		test_cmp before after
+	)
+'
+
+test_expect_success 'surface-gc --dry-run reports caught up once fully stratified' '
+	test_create_repo dry-run-caught-up &&
+	(
+		cd dry-run-caught-up &&
+
+		test_commit --no-tag c1 &&
+		test_commit --no-tag c2 &&
+		test_commit --no-tag c3 &&
+
+		git config --add maintenance.stratified.anchor refs/heads/master &&
+
+		# Unbounded batch: the whole eligible history is stratified in
+		# one run, so nothing old remains outside the frontier.
+		git maintenance run --task=stratify --quiet &&
+
+		ls .git/objects/pack >before &&
+		git maintenance run --task=surface-gc --dry-run >out &&
+		ls .git/objects/pack >after &&
+
+		test_grep "refs/heads/master: caught up (frontier width 1)" out &&
+		test_grep "surface-gc would run" out &&
+		test_cmp before after
+	)
+'
+
+test_expect_success 'surface-gc --dry-run reports anchors with no stratified commits yet' '
+	test_create_repo dry-run-no-frontier &&
+	(
+		cd dry-run-no-frontier &&
+		test_commit --no-tag c1 &&
+		git config --add maintenance.stratified.anchor refs/heads/master &&
+
+		# No stratify run yet: the anchor has no base-stratum pack.
+		git maintenance run --task=surface-gc --dry-run >out &&
+		test_grep "refs/heads/master: no stratified commits yet" out &&
+		test_grep "surface-gc would be skipped" out
+	)
+'
+
+test_expect_success '--dry-run is rejected for tasks other than surface-gc' '
+	test_create_repo dry-run-guardrail &&
+	(
+		cd dry-run-guardrail &&
+		test_commit --no-tag c1 &&
+		git config --add maintenance.stratified.anchor refs/heads/master &&
+
+		test_must_fail git maintenance run --task=gc --dry-run 2>err &&
+		test_grep "only supported with --task=surface-gc" err &&
+
+		test_must_fail git maintenance run --dry-run 2>err2 &&
+		test_grep "only supported with --task=surface-gc" err2 &&
+
+		test_must_fail git maintenance run --task=surface-gc --dry-run --auto 2>err3 &&
+		test_grep "dry-run" err3
+	)
+'
+
 test_done

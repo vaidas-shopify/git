@@ -283,6 +283,7 @@ struct maintenance_run_opts {
 	int auto_flag;
 	int detach;
 	int quiet;
+	int dry_run;
 	enum schedule_priority schedule;
 };
 #define MAINTENANCE_RUN_OPTS_INIT { \
@@ -1085,7 +1086,7 @@ out:
 }
 
 static const char *const builtin_maintenance_run_usage[] = {
-	N_("git maintenance run [--auto] [--[no-]quiet] [--task=<task>] [--schedule]"),
+	N_("git maintenance run [--auto] [--[no-]quiet] [--task=<task>] [--schedule] [--dry-run]"),
 	NULL
 };
 
@@ -2298,6 +2299,68 @@ static enum stratify_caught_up stratify_anchor_caught_up(struct repository *r,
 	strbuf_release(&out);
 	oid_array_clear(&frontier);
 	return result;
+}
+
+/*
+ * Like stratify_anchor_caught_up(), but reports the full lag distance for a
+ * human-readable status report rather than a cheap caught-up/lagging boolean.
+ *
+ * Counts commits older than `cutoff_ts` still reachable from `tip_oid` after
+ * excluding the anchor's stratified frontier antichain, and stores the
+ * frontier width (antichain size) in *width. A zero width means the anchor
+ * has no base-stratum pack yet (the caller reports that distinctly). Returns
+ * the lag count (0 == caught up), or -1 on rev-list failure.
+ *
+ * This uses `--count` (a full walk) rather than the gate's `--max-count=1`
+ * early-stop because the report wants the actual distance, not just presence.
+ */
+static long stratify_anchor_lag(struct repository *r, const char *anchor_ref,
+				const struct object_id *tip_oid,
+				timestamp_t cutoff_ts, size_t *width)
+{
+	struct oid_array frontier = OID_ARRAY_INIT;
+	struct child_process rev_list = CHILD_PROCESS_INIT;
+	struct strbuf out = STRBUF_INIT;
+	long lag = -1;
+	int count;
+	size_t i;
+
+	find_stratified_frontier(r, anchor_ref, tip_oid, &frontier);
+	*width = frontier.nr;
+	if (!frontier.nr) {
+		oid_array_clear(&frontier);
+		return 0;
+	}
+
+	rev_list.git_cmd = 1;
+	strvec_pushl(&rev_list.args, "rev-list", "--count", NULL);
+	strvec_pushf(&rev_list.args, "--before=%"PRItime, cutoff_ts);
+	strvec_push(&rev_list.args, oid_to_hex(tip_oid));
+	for (i = 0; i < frontier.nr; i++)
+		strvec_pushf(&rev_list.args, "^%s", oid_to_hex(&frontier.oid[i]));
+
+	rev_list.out = -1;
+	if (start_command(&rev_list))
+		goto done;
+	if (strbuf_read(&out, rev_list.out, 0) < 0) {
+		close(rev_list.out);
+		finish_command(&rev_list);
+		goto done;
+	}
+	close(rev_list.out);
+	if (finish_command(&rev_list))
+		goto done;
+
+	strbuf_trim(&out);
+	if (strtol_i(out.buf, 10, &count) || count < 0)
+		lag = -1;
+	else
+		lag = count;
+
+done:
+	strbuf_release(&out);
+	oid_array_clear(&frontier);
+	return lag;
 }
 
 /*
@@ -3792,6 +3855,52 @@ static int consolidate_stratum_auto_condition(struct gc_config *cfg UNUSED)
  * cover the active stratum.
  */
 /*
+ * Compute the surface-gc readiness cutoff timestamp from
+ * maintenance.stratified.min-age and .grace-period.
+ *
+ * min-age is the timestamp boundary stratify packs before (matching the
+ * --before=<min-age> rev-list elsewhere); grace-period is an additional
+ * relative duration behind now. The cutoff is min-age pushed back by the
+ * grace duration:
+ *   cutoff = min_age - (now - grace)
+ * Both values must be relative durations (e.g. "2.weeks.ago"); parse them
+ * carefully so a malformed value is rejected rather than silently treated as
+ * "now" (which would let surface-gc run prematurely).
+ *
+ * On success returns 0, stores the cutoff in *cutoff_ts, and points
+ * *min_age_str / *grace_str at the configured (or default) strings for use in
+ * diagnostics. Returns -1 if either value is malformed.
+ */
+static int compute_stratify_cutoff(struct repository *r, timestamp_t *cutoff_ts,
+				   const char **min_age_str, const char **grace_str)
+{
+	timestamp_t now_ts, min_age_ts, grace_ts, grace_offset;
+	int min_err = 0, grace_err = 0;
+
+	*min_age_str = "2.weeks.ago";
+	*grace_str = "1.week.ago";
+	repo_config_get_string_tmp(r, "maintenance.stratified.min-age",
+				   min_age_str);
+	repo_config_get_string_tmp(r, "maintenance.stratified.grace-period",
+				   grace_str);
+
+	now_ts = approxidate("now");
+	min_age_ts = approxidate_careful(*min_age_str, &min_err);
+	grace_ts = approxidate_careful(*grace_str, &grace_err);
+	if (min_err || grace_err)
+		return -1;
+
+	/*
+	 * Clamp so a value resolving to the future cannot underflow the
+	 * unsigned subtraction into a far-past cutoff that would wrongly
+	 * report "caught up".
+	 */
+	grace_offset = now_ts > grace_ts ? now_ts - grace_ts : 0;
+	*cutoff_ts = min_age_ts > grace_offset ? min_age_ts - grace_offset : 0;
+	return 0;
+}
+
+/*
  * Check whether stratify stratifying has caught up sufficiently for
  * surface-gc to be worthwhile. For each anchor ref, ask whether any
  * commit older than (now - min-age - grace) is still reachable from
@@ -3803,9 +3912,8 @@ static int consolidate_stratum_auto_condition(struct gc_config *cfg UNUSED)
 static int stratify_stratifying_caught_up(struct repository *r, int quiet)
 {
 	struct string_list anchors = STRING_LIST_INIT_DUP;
-	const char *min_age_str = "2.weeks.ago";
-	const char *grace_str = "1.week.ago";
-	timestamp_t now_ts, min_age_ts, grace_ts, cutoff_ts;
+	const char *min_age_str, *grace_str;
+	timestamp_t cutoff_ts;
 	int ret = 1;
 	size_t i;
 
@@ -3814,45 +3922,13 @@ static int stratify_stratifying_caught_up(struct repository *r, int quiet)
 		goto out;
 	}
 
-	repo_config_get_string_tmp(r, "maintenance.stratified.min-age",
-				   &min_age_str);
-	repo_config_get_string_tmp(r, "maintenance.stratified.grace-period",
-				   &grace_str);
-
-	/*
-	 * min-age is the timestamp boundary stratify packs before (matching
-	 * the --before=<min-age> rev-list elsewhere); grace-period is an
-	 * additional relative duration behind now. The cutoff is min-age
-	 * pushed back by the grace duration:
-	 *   cutoff = min_age - (now - grace)
-	 * Both values must be relative durations (e.g. "2.weeks.ago"); parse
-	 * them carefully so a malformed value is rejected rather than silently
-	 * treated as "now" (which would let surface-gc run prematurely).
-	 */
-	{
-		int min_err = 0, grace_err = 0;
-		timestamp_t grace_offset;
-
-		now_ts = approxidate("now");
-		min_age_ts = approxidate_careful(min_age_str, &min_err);
-		grace_ts = approxidate_careful(grace_str, &grace_err);
-		if (min_err || grace_err) {
-			if (!quiet)
-				fprintf(stderr,
-					_("surface-gc: invalid maintenance.stratified.min-age "
-					  "or grace-period; skipping\n"));
-			ret = 0;
-			goto out;
-		}
-
-		/*
-		 * Clamp so a value resolving to the future cannot underflow
-		 * the unsigned subtraction into a far-past cutoff that would
-		 * wrongly report "caught up".
-		 */
-		grace_offset = now_ts > grace_ts ? now_ts - grace_ts : 0;
-		cutoff_ts = min_age_ts > grace_offset ?
-			min_age_ts - grace_offset : 0;
+	if (compute_stratify_cutoff(r, &cutoff_ts, &min_age_str, &grace_str)) {
+		if (!quiet)
+			fprintf(stderr,
+				_("surface-gc: invalid maintenance.stratified.min-age "
+				  "or grace-period; skipping\n"));
+		ret = 0;
+		goto out;
 	}
 
 	for (i = 0; i < anchors.nr; i++) {
@@ -3918,6 +3994,96 @@ out:
 	return ret;
 }
 
+/*
+ * Read-only counterpart to stratify_stratifying_caught_up(): for each
+ * configured anchor, print whether it is caught up or how far it is lagging,
+ * plus the resulting surface-gc verdict, without touching the repository.
+ * Reached via `git maintenance run --task=surface-gc --dry-run`. Always
+ * returns 0 — it is a report, not a gate.
+ */
+static int report_stratify_status(struct repository *r)
+{
+	struct string_list anchors = STRING_LIST_INIT_DUP;
+	const char *min_age_str, *grace_str;
+	timestamp_t cutoff_ts;
+	const char *blocker = NULL;
+	size_t i;
+
+	if (load_unique_stratify_anchors(r, &anchors)) {
+		printf(_("stratify status: no anchors configured\n"));
+		goto out;
+	}
+
+	if (compute_stratify_cutoff(r, &cutoff_ts, &min_age_str, &grace_str)) {
+		printf(_("stratify status: invalid maintenance.stratified.min-age "
+			 "or grace-period\n"));
+		goto out;
+	}
+
+	printf(_("stratify status (cutoff: min-age %s, grace-period %s)\n"),
+	       min_age_str, grace_str);
+
+	for (i = 0; i < anchors.nr; i++) {
+		const char *anchor_ref = anchors.items[i].string;
+		struct object_id tip_oid;
+		size_t width = 0;
+		long lag;
+		const char *state;
+
+		if (!refs_resolve_ref_unsafe(get_main_ref_store(r), anchor_ref,
+					     RESOLVE_REF_READING, &tip_oid,
+					     NULL)) {
+			state = "unresolvable";
+			printf(_("  %s: unresolvable, skipped\n"), anchor_ref);
+			if (!blocker)
+				blocker = anchor_ref;
+			goto record;
+		}
+
+		lag = stratify_anchor_lag(r, anchor_ref, &tip_oid, cutoff_ts,
+					  &width);
+		if (!width) {
+			state = "no-frontier";
+			printf(_("  %s: no stratified commits yet\n"), anchor_ref);
+			if (!blocker)
+				blocker = anchor_ref;
+		} else if (lag < 0) {
+			state = "error";
+			printf(_("  %s: readiness check failed\n"), anchor_ref);
+			if (!blocker)
+				blocker = anchor_ref;
+		} else if (lag == 0) {
+			state = "caught-up";
+			printf(_("  %s: caught up (frontier width %"PRIuMAX")\n"),
+			       anchor_ref, (uintmax_t)width);
+		} else {
+			state = "lagging";
+			printf(Q_("  %s: lagging by %ld commit (frontier width %"PRIuMAX")\n",
+				  "  %s: lagging by %ld commits (frontier width %"PRIuMAX")\n",
+				  lag),
+			       anchor_ref, lag, (uintmax_t)width);
+			if (!blocker)
+				blocker = anchor_ref;
+		}
+
+record:
+		trace2_data_string("surface-gc", r, "dry-run/anchor", anchor_ref);
+		trace2_data_string("surface-gc", r, "dry-run/state", state);
+	}
+
+	if (anchors.nr) {
+		if (blocker)
+			printf(_("surface-gc would be skipped (%s is not caught up)\n"),
+			       blocker);
+		else
+			printf(_("surface-gc would run\n"));
+	}
+
+out:
+	string_list_clear(&anchors, 0);
+	return 0;
+}
+
 static int maintenance_task_surface_gc(struct maintenance_run_opts *opts,
 				      struct gc_config *cfg UNUSED)
 {
@@ -3927,6 +4093,9 @@ static int maintenance_task_surface_gc(struct maintenance_run_opts *opts,
 	const char *expiration = "2.weeks.ago";
 	int have_base_stratum = 0;
 	int kept_packs = 0;
+
+	if (opts->dry_run)
+		return report_stratify_status(r);
 
 	if (repo_config_get_string_tmp(r, "maintenance.stratified.cruft-expiration",
 				       &expiration))
@@ -4433,6 +4602,8 @@ static int maintenance_run(int argc, const char **argv, const char *prefix,
 		OPT_CALLBACK_F(0, "task", &selected_tasks, N_("task"),
 			N_("run a specific task"),
 			PARSE_OPT_NONEG, task_option_parse),
+		OPT_BOOL(0, "dry-run", &opts.dry_run,
+			 N_("report stratification status without modifying the repository")),
 		OPT_END()
 	};
 	int ret;
@@ -4448,6 +4619,22 @@ static int maintenance_run(int argc, const char **argv, const char *prefix,
 				  opts.schedule, "--schedule=");
 	die_for_incompatible_opt2(selected_tasks.nr, "--task=",
 				  opts.schedule, "--schedule=");
+
+	/*
+	 * --dry-run must never mutate the repository, so it is restricted to
+	 * exactly "--task=surface-gc", whose dry-run path only reports
+	 * stratification status. Reject every other combination rather than
+	 * silently letting a mutating task run.
+	 */
+	if (opts.dry_run) {
+		die_for_incompatible_opt2(opts.dry_run, "--dry-run",
+					  opts.auto_flag, "--auto");
+		die_for_incompatible_opt2(opts.dry_run, "--dry-run",
+					  opts.schedule, "--schedule=");
+		if (selected_tasks.nr != 1 ||
+		    strcmp(selected_tasks.items[0].string, "surface-gc"))
+			die(_("--dry-run is only supported with --task=surface-gc"));
+	}
 
 	gc_config(&cfg);
 	initialize_task_config(&opts, &selected_tasks);

@@ -303,6 +303,16 @@ OPTIONS
 	`maintenance.<task>.enabled` configured as `true` are considered.
 	See the 'TASKS' section for the list of accepted `<task>` values.
 
+--dry-run::
+	Report what `surface-gc` would do without modifying the repository.
+	Currently only supported together with `--task=surface-gc`. For each
+	configured `maintenance.stratified.anchor`, prints whether stratifying
+	is caught up or how far it is lagging (commits older than
+	`maintenance.stratified.min-age` plus `maintenance.stratified.grace-period`
+	that remain outside the stratified frontier), the frontier antichain
+	width, and the resulting `surface-gc` verdict. Combining `--dry-run`
+	with any other task, with `--auto`, or with `--schedule` is an error.
+
 --scheduler=auto|crontab|systemd-timer|launchctl|schtasks::
 	When combined with the `start` subcommand, specify the scheduler
 	for running the hourly, daily and weekly executions of
