@@ -1268,7 +1268,7 @@ test_expect_success 'stratify-prune leaves configured anchors alone' '
 	)
 '
 
-test_expect_success 'stratify-prune is wired into --schedule=weekly' '
+test_expect_success 'stratify-prune is never scheduled and runs only when selected' '
 	test_create_repo prune-schedule &&
 	(
 		cd prune-schedule &&
@@ -1277,16 +1277,48 @@ test_expect_success 'stratify-prune is wired into --schedule=weekly' '
 		git config maintenance.strategy geometric &&
 		git config --add maintenance.stratified.anchor refs/heads/master &&
 
-		# Without --schedule= the task only runs when explicitly
-		# selected; with --schedule=daily it should be skipped (it
-		# is a weekly task); with --schedule=weekly it should run.
+		# stratify-prune demotes packs, so it is deliberately absent
+		# from every strategy: a misconfigured anchor list must not let
+		# a scheduled or whole-strategy run retire the base stratum.
 		GIT_TRACE2_EVENT="$(pwd)/daily.txt" \
 			git maintenance run --schedule=daily --no-quiet &&
 		! grep "\"label\":\"stratify-prune\"" daily.txt &&
 
 		GIT_TRACE2_EVENT="$(pwd)/weekly.txt" \
 			git maintenance run --schedule=weekly --no-quiet &&
-		grep "\"label\":\"stratify-prune\"" weekly.txt
+		! grep "\"label\":\"stratify-prune\"" weekly.txt &&
+
+		# A bare "git maintenance run" (manual strategy) skips it too.
+		GIT_TRACE2_EVENT="$(pwd)/manual.txt" \
+			git maintenance run --no-quiet &&
+		! grep "\"label\":\"stratify-prune\"" manual.txt &&
+
+		# It still runs when the user selects it explicitly.
+		GIT_TRACE2_EVENT="$(pwd)/explicit.txt" \
+			git maintenance run --task=stratify-prune --no-quiet &&
+		grep "\"label\":\"stratify-prune\"" explicit.txt
+	)
+'
+
+test_expect_success 'maintenance.stratify-prune.enabled opts the task back into manual runs' '
+	test_create_repo prune-opt-in &&
+	(
+		cd prune-opt-in &&
+		test_commit --no-tag c1 &&
+
+		git config maintenance.strategy geometric &&
+		git config --add maintenance.stratified.anchor refs/heads/master &&
+
+		# Default: a bare run does not include stratify-prune.
+		GIT_TRACE2_EVENT="$(pwd)/off.txt" \
+			git maintenance run --no-quiet &&
+		! grep "\"label\":\"stratify-prune\"" off.txt &&
+
+		# Explicit per-repo opt-in re-enables it for manual runs.
+		git config maintenance.stratify-prune.enabled true &&
+		GIT_TRACE2_EVENT="$(pwd)/on.txt" \
+			git maintenance run --no-quiet &&
+		grep "\"label\":\"stratify-prune\"" on.txt
 	)
 '
 

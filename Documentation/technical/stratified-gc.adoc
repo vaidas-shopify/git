@@ -213,6 +213,13 @@ for a repository — `stratify` itself becomes a no-op once the config
 is empty, and `stratify-prune` reclaims the previously-stratified
 packs into the active stratum.
 
+Because demotion is destructive when the anchor list is empty or
+misconfigured, `stratify-prune` is deliberately excluded from every
+maintenance strategy. It is never run on a schedule or as part of a
+bare `git maintenance run`; it runs only when invoked explicitly with
+`--task=stratify-prune`. A transient or accidental config slip therefore
+cannot trigger an unattended retirement of the whole base stratum.
+
 The surface-gc maintenance task
 ------------------------------
 

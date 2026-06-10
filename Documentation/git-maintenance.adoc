@@ -244,6 +244,15 @@ not demote them, so a typo or a temporary edit to
 `maintenance.stratified.anchor` does not blast away curated packs. The
 `stratify-prune` task is the explicit cleanup step.
 +
+Because it demotes packs, `stratify-prune` is intentionally not part of
+any maintenance strategy: it is never run on a schedule or as part of a
+bare `git maintenance run`. It runs only when you select it explicitly
+with `--task=stratify-prune`, so an empty or misconfigured anchor list
+cannot cause an unattended run to retire the whole base stratum. A
+repository can opt the task back into scheduled or manual runs by setting
+`maintenance.stratify-prune.enabled` (and, for scheduled runs,
+`maintenance.stratify-prune.schedule`).
++
 If no anchors are configured, the configured set is empty and every
 base-stratum pack is considered an orphan, so the task demotes them
 all. This makes `stratify-prune` the explicit, idempotent way to wind

@@ -4456,10 +4456,16 @@ static const struct maintenance_strategy geometric_strategy = {
 			.type = MAINTENANCE_TYPE_SCHEDULED | MAINTENANCE_TYPE_MANUAL,
 			.schedule = SCHEDULE_DAILY,
 		},
-		[TASK_STRATIFY_PRUNE] = {
-			.type = MAINTENANCE_TYPE_SCHEDULED | MAINTENANCE_TYPE_MANUAL,
-			.schedule = SCHEDULE_WEEKLY,
-		},
+		/*
+		 * stratify-prune is deliberately absent from every strategy: it
+		 * demotes base-stratum packs, and an empty or misconfigured
+		 * maintenance.stratified.anchor turns every pack into an orphan.
+		 * Were it scheduled or part of the manual strategy, a transient
+		 * config slip would silently retire the whole base stratum and
+		 * force an expensive re-stratification. It runs only when the
+		 * user selects it explicitly with --task=stratify-prune (or opts
+		 * a repo in via maintenance.stratify-prune.enabled).
+		 */
 		[TASK_CONSOLIDATE_STRATUM] = {
 			.type = MAINTENANCE_TYPE_SCHEDULED | MAINTENANCE_TYPE_MANUAL,
 			.schedule = SCHEDULE_DAILY,
