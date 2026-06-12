@@ -4084,6 +4084,23 @@ out:
 	return 0;
 }
 
+/*
+ * Mirror git-repack(1)'s default for whether bitmaps should be written.
+ * `repack.writeBitmaps` (or its older `pack.writeBitmaps` spelling) wins
+ * when set; otherwise the cruft repack run by surface-gc is an
+ * all-into-one repack, so bitmaps default on for bare repositories.
+ */
+static int surface_gc_wants_bitmaps(struct repository *r)
+{
+	int value;
+
+	if (!repo_config_get_bool(r, "repack.writebitmaps", &value))
+		return value;
+	if (!repo_config_get_bool(r, "pack.writebitmaps", &value))
+		return value;
+	return is_bare_repository();
+}
+
 static int maintenance_task_surface_gc(struct maintenance_run_opts *opts,
 				      struct gc_config *cfg UNUSED)
 {
@@ -4143,6 +4160,18 @@ static int maintenance_task_surface_gc(struct maintenance_run_opts *opts,
 
 	if (have_base_stratum)
 		strvec_push(&child.args, "--kept-pack-boundary");
+
+	/*
+	 * With --kept-pack-boundary the surface pack deliberately omits
+	 * every base-stratum object, so it cannot satisfy a single-pack
+	 * bitmap's closure requirement on its own. Always write a
+	 * multi-pack index, which spans the kept base-stratum packs and
+	 * the new surface pack; when bitmaps are wanted they are written
+	 * as a MIDX bitmap that closes across the stratum boundary.
+	 */
+	strvec_push(&child.args, "--write-midx");
+	if (surface_gc_wants_bitmaps(r))
+		strvec_push(&child.args, "--write-bitmap-index");
 
 	/*
 	 * If no base-stratum packs exist, this degrades to a normal

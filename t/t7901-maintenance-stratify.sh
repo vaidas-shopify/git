@@ -1038,6 +1038,81 @@ test_expect_success 'demoted orphan retains its objects after surface-gc' '
 	)
 '
 
+# Build "old history fully stratified, one recent surface commit left
+# active" -- the caught-up shape surface-gc requires. Old commits use the
+# incrementing test_tick dates (years old, so eligible and stratified);
+# the surface commit is dated now, so it stays outside the frontier
+# without making stratifying lag. test_commit accumulates files, so the
+# surface commit's tree and parent reference c1/c2 objects that live only
+# in the base-stratum pack -- exactly the objects the surface pack omits,
+# forcing the bitmap to close across the boundary.
+setup_surface_commit () {
+	test_commit --no-tag c1 &&
+	test_commit --no-tag c2 &&
+
+	git config --add maintenance.stratified.anchor refs/heads/master &&
+	git maintenance run --task=stratify --quiet &&
+	test 1 -le $(count_sidecars) &&
+
+	now=$(date +%s) &&
+	recent="@$now +0000" &&
+	echo surface >surface.t &&
+	git add surface.t &&
+	GIT_AUTHOR_DATE="$recent" GIT_COMMITTER_DATE="$recent" \
+		git commit -q -m surface
+}
+
+test_expect_success 'surface-gc writes a closing MIDX bitmap when bitmaps are enabled' '
+	test_create_repo surface-gc-bitmap &&
+	(
+		cd surface-gc-bitmap &&
+
+		# Bitmaps on. This is what bare repositories get by default
+		# for the all-into-one cruft repack surface-gc runs, and it
+		# is the configuration that exposed the closure failure: the
+		# surface pack omits every base-stratum object, so a
+		# single-pack bitmap could not reach across the boundary.
+		git config repack.writeBitmaps true &&
+
+		setup_surface_commit &&
+
+		git maintenance run --task=surface-gc --no-quiet 2>err &&
+
+		# The bug manifested as a fatal bitmap-closure failure.
+		test_grep ! "full closure" err &&
+		test_grep ! "failed to write bitmap index" err &&
+
+		# The closing artifact is a MIDX bitmap spanning the kept
+		# base-stratum packs and the surface pack, not a per-pack
+		# .bitmap (which could not close on its own).
+		test 1 -eq $(ls .git/objects/pack/multi-pack-index-*.bitmap 2>/dev/null | wc -l) &&
+		test 0 -eq $(ls .git/objects/pack/pack-*.bitmap 2>/dev/null | wc -l) &&
+
+		# The bitmap must actually be usable and the repo intact.
+		git rev-list --use-bitmap-index --count --all >/dev/null &&
+		git fsck --strict
+	)
+'
+
+test_expect_success 'surface-gc skips bitmaps when the environment does not want them' '
+	test_create_repo surface-gc-nobitmap &&
+	(
+		cd surface-gc-nobitmap &&
+
+		# Non-bare repo, no repack.writeBitmaps: bitmaps default
+		# off, so surface-gc must not attempt (and fail) to write
+		# one. A MIDX without a bitmap is still written and is fine.
+		setup_surface_commit &&
+
+		git maintenance run --task=surface-gc --no-quiet 2>err &&
+
+		test_grep ! "failed to write bitmap index" err &&
+		test 1 -eq $(ls .git/objects/pack/multi-pack-index 2>/dev/null | wc -l) &&
+		test 0 -eq $(ls .git/objects/pack/multi-pack-index-*.bitmap 2>/dev/null | wc -l) &&
+		git fsck --strict
+	)
+'
+
 test_expect_success 'corrupt-sidecar ancestor pack stays a boundary; merge side survives surface-gc' '
 	test_create_repo merge-corrupt-closure &&
 	(
